@@ -4,11 +4,12 @@ motor
 pymongo
 python-dotenv
 pydantic
-scikit-learn
+scikit-learn==1.7.2
 joblib
 numpy
 pandas
 python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt==4.0.1
 httpx
