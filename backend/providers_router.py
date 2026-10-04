@@ -146,6 +146,17 @@ async def save_listing(body: dict):
     return _public(await listings_collection.find_one({"email": email}))
 
 
+@router.delete("/listings")
+async def delete_listing(email: str):
+    """Provider removes their listing → no longer shown in Find Help, and goes offline."""
+    email = email.lower()
+    res = await listings_collection.delete_one({"email": email})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="You don't have a listing")
+    await providers_collection.update_one({"email": email}, {"$set": {"online": False, "services": []}})
+    return {"ok": True}
+
+
 # ─────────────────────────── customer: find help near me
 @router.get("/listings/nearby")
 async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: str = "", radius: float = 25):
