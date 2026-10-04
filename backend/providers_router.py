@@ -68,17 +68,20 @@ def _open_now(hours: dict) -> bool:
     return o <= hm < c if o < c else (hm >= o or hm < c)   # supports overnight hours
 
 async def _online_map(emails):
+    """email → (lat, lng) of providers who are online right now (lat/lng may be None)."""
     since = datetime.utcnow() - timedelta(minutes=ONLINE_TTL_MIN)
     out = {}
     async for p in providers_collection.find({"email": {"$in": list(emails)}}):
-        out[p["email"]] = bool(p.get("online")) and p.get("updatedAt", since) >= since
+        if p.get("online") and p.get("updatedAt", since) >= since:
+            out[p["email"]] = (p.get("lat"), p.get("lng"))
     return out
 
-def _public(l, online=False, distance=None):
+def _public(l, online=False, distance=None, live=None):
     d = {k: v for k, v in l.items() if k not in ("_id",)}
     d["_id"] = str(l["_id"])
-    if not l.get("show_exact", True):          # privacy: area only (~1 km precision)
-        d["lat"], d["lng"] = round(l["lat"], 2), round(l["lng"], 2)
+    if live:                                   # online → show where the provider is right now
+        d["lat"], d["lng"] = live
+    d["all_services"] = list(l.get("services", [])) + list(l.get("custom_services", []))
     d["online"] = online
     d["open_now"] = _open_now(l.get("hours"))
     if distance is not None:
@@ -99,15 +102,21 @@ async def save_listing(body: dict):
     if not user or user.get("role") != "service_provider":
         raise HTTPException(status_code=403, detail="Only service providers can create a listing")
     services = [s for s in (body.get("services") or []) if s in ALL_SERVICES]
+    # services typed by the provider that are not in the list (e.g. "Water tank cleaning")
+    custom = []
+    for c in (body.get("custom_services") or []):
+        c = re.sub(r"\s+", " ", str(c)).strip()[:40]
+        if c and c.lower() not in [x.lower() for x in custom] and len(custom) < 10:
+            custom.append(c)
     name = (body.get("business_name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Enter your business or display name")
-    if not services:
-        raise HTTPException(status_code=400, detail="Choose at least one service")
+    if not services and not custom:
+        raise HTTPException(status_code=400, detail="Choose or type at least one service")
     try:
         lat, lng = float(body["lat"]), float(body["lng"])
     except (KeyError, TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Set your base location")
+        raise HTTPException(status_code=400, detail="Set your location")
     hours = body.get("hours") or {}
     tm = re.compile(r"^\d{2}:\d{2}$")
     hours = {
@@ -118,15 +127,15 @@ async def save_listing(body: dict):
     doc = {
         "email": email, "business_name": name[:60],
         "description": (body.get("description") or "")[:400],
-        "services": services, "groups": sorted({GROUP_OF[s] for s in services}),
+        "services": services, "custom_services": custom,
+        "groups": sorted({GROUP_OF[s] for s in services} | ({"other"} if custom else set())),
         "lat": lat, "lng": lng, "area": (body.get("area") or "")[:80],
-        "show_exact": bool(body.get("show_exact", True)),
-        "radius_km": max(1, min(50, int(body.get("radius_km") or 10))),
+        "radius_km": 25,
         "hours": hours,
         "price_from": max(0, int(float(body.get("price_from") or 0))),
         "phone": (body.get("phone") or user.get("phone") or "")[:20],
         "whatsapp": (body.get("whatsapp") or "")[:20],
-        "published": bool(body.get("published", True)),
+        "published": True,
         "updatedAt": datetime.utcnow(),
     }
     await listings_collection.update_one({"email": email}, {"$set": doc, "$setOnInsert": {"createdAt": datetime.utcnow(),
@@ -140,23 +149,28 @@ async def save_listing(body: dict):
 # ─────────────────────────── customer: find help near me
 @router.get("/listings/nearby")
 async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: str = "", radius: float = 25):
-    query = {"published": True}
+    query = {"published": {"$ne": False}}
     if service:
-        query["services"] = service
+        query["$or"] = [{"services": service}, {"custom_services": service}]
     elif group:
         query["groups"] = group
-    rows = []
-    async for l in listings_collection.find(query):
-        d = _km(lat, lng, l["lat"], l["lng"])
+    listings = [l async for l in listings_collection.find(query)]
+    online = await _online_map([l["email"] for l in listings])
+    out = []
+    for l in listings:
+        live = online.get(l["email"])
+        pos = live if live and live[0] is not None else (l.get("lat"), l.get("lng"))
+        if pos[0] is None:
+            continue
+        d = _km(lat, lng, pos[0], pos[1])
         if d > radius:
             continue
         if q:
-            text = f"{l.get('business_name','')} {l.get('description','')} {' '.join(l.get('services', []))} {l.get('area','')}".lower()
+            text = " ".join([l.get("business_name", ""), l.get("description", ""), l.get("area", ""),
+                             " ".join(l.get("services", [])).replace("_", " "), " ".join(l.get("custom_services", []))]).lower()
             if q.lower() not in text:
                 continue
-        rows.append((d, l))
-    online = await _online_map([l["email"] for _, l in rows])
-    out = [_public(l, online.get(l["email"], False), d) for d, l in rows]
+        out.append(_public(l, l["email"] in online, d, live if live and live[0] is not None else None))
     # 🟢 online first, then open now, then nearest
     out.sort(key=lambda x: (not x["online"], not x["open_now"], x["distance_km"]))
     return out
@@ -167,7 +181,8 @@ async def listing(lid: str):
     if not l:
         raise HTTPException(status_code=404, detail="Listing not found")
     online = await _online_map([l["email"]])
-    return _public(l, online.get(l["email"], False))
+    live = online.get(l["email"])
+    return _public(l, l["email"] in online, None, live if live and live[0] is not None else None)
 
 
 # ─────────────────────────── bookings (for later)
@@ -180,7 +195,8 @@ async def create_booking(body: dict):
     l = await listings_collection.find_one({"_id": _oid(body.get("listing_id"))})
     if not l:
         raise HTTPException(status_code=404, detail="Provider not found")
-    service = body.get("service") if body.get("service") in l["services"] else l["services"][0]
+    offered = list(l.get("services", [])) + list(l.get("custom_services", []))
+    service = body.get("service") if body.get("service") in offered else offered[0]
     try:
         when = datetime.fromisoformat(str(body.get("when")).replace("Z", ""))
     except ValueError:
@@ -191,6 +207,8 @@ async def create_booking(body: dict):
         "customer_email": email, "customer_name": user.get("name", ""), "customer_phone": user.get("phone", ""),
         "service": service, "when": when, "note": (body.get("note") or "")[:300],
         "address": (body.get("address") or "")[:200],
+        "lat": body.get("lat"), "lng": body.get("lng"),          # where the provider must go
+        "payment_method": "cash" if body.get("payment_method") == "cash" else "card",
         "status": "pending", "createdAt": datetime.utcnow(),
     }
     res = await bookings_collection.insert_one(doc)
@@ -212,6 +230,8 @@ async def booking_action(bid: str, action: str, body: dict):
     if not b:
         raise HTTPException(status_code=404, detail="Booking not found")
     email = (body.get("email") or "").lower()
+    if action == "start":
+        return await _start_booking(b, email)
     rules = {
         "accept":   ("provider", ["pending"], "accepted"),
         "decline":  ("provider", ["pending"], "declined"),
@@ -230,3 +250,35 @@ async def booking_action(bid: str, action: str, body: dict):
     if new == "completed":
         await listings_collection.update_one({"email": b["provider_email"]}, {"$inc": {"jobs_done": 1}})
     return {"status": new}
+
+
+async def _start_booking(b, email):
+    """Provider starts an accepted booking → it becomes a live request
+    (tracking → arrival code → bill → card/cash), exactly like "Request now"."""
+    if email != b["provider_email"]:
+        raise HTTPException(status_code=403, detail="Not your booking")
+    if b["status"] == "in_progress" and b.get("request_id"):
+        return {"status": "in_progress", "request_id": b["request_id"]}
+    if b["status"] != "accepted":
+        raise HTTPException(status_code=400, detail="Accept the booking first")
+    if b.get("lat") is None:
+        raise HTTPException(status_code=400, detail="This booking has no customer location")
+    requests_collection = database.get_collection("service_requests")
+    busy = await requests_collection.find_one({"provider.email": email,
+                                               "status": {"$in": ["accepted", "arrived", "in_progress", "payment_due", "cash_confirm_pending"]}})
+    if busy:
+        raise HTTPException(status_code=400, detail="Finish your current job first")
+    p = await providers_collection.find_one({"email": email}) or {}
+    now = datetime.utcnow()
+    req = {
+        "customer_email": b["customer_email"], "customer_name": b.get("customer_name", ""), "customer_phone": b.get("customer_phone", ""),
+        "service_type": b["service"], "vehicle_type": "", "note": b.get("note", ""), "address": b.get("address", ""),
+        "lat": float(b["lat"]), "lng": float(b["lng"]), "payment_method": b.get("payment_method", "card"),
+        "status": "accepted", "target_provider": email, "booking_id": str(b["_id"]),
+        "provider": {"email": email, "name": b.get("provider_name", ""), "phone": b.get("provider_phone", ""),
+                     "lat": p.get("lat"), "lng": p.get("lng")},
+        "createdAt": now, "acceptedAt": now,
+    }
+    res = await requests_collection.insert_one(req)
+    await bookings_collection.update_one({"_id": b["_id"]}, {"$set": {"status": "in_progress", "request_id": str(res.inserted_id), "startedAt": now}})
+    return {"status": "in_progress", "request_id": str(res.inserted_id)}

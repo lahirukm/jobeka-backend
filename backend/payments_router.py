@@ -111,6 +111,9 @@ async def _complete_payment(order: dict, payhere_payment_id: str = "", method: s
             {"$set": {"status": "completed", "paid_method": "card", "paid_at": now, "completedAt": now}},
         )
         await database.get_collection("provider_listings").update_one({"email": order["worker_email"]}, {"$inc": {"jobs_done": 1}})
+        sr = await database.get_collection("service_requests").find_one({"_id": ObjectId(order["job_id"])})
+        if sr and sr.get("booking_id"):
+            await database.get_collection("bookings").update_one({"_id": ObjectId(sr["booking_id"])}, {"$set": {"status": "completed", "completedAt": now}})
     else:
         await jobs_collection.update_one(
             {"_id": ObjectId(order["job_id"])},

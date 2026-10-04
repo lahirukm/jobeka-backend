@@ -94,6 +94,9 @@ async def provider_status(body: dict):
     if body.get("lat") is not None and body.get("lng") is not None:
         update["lat"], update["lng"] = float(body["lat"]), float(body["lng"])
     await providers_collection.update_one({"email": email}, {"$set": update}, upsert=True)
+    # a listing without a location takes the first live location automatically
+    if "lat" in update:
+        await listings_collection.update_one({"email": email, "lat": None}, {"$set": {"lat": update["lat"], "lng": update["lng"]}})
     return {"ok": True, "online": update["online"], "services": services}
 
 @router.get("/providers/me")
@@ -113,8 +116,12 @@ async def create_request(body: dict):
         raise HTTPException(status_code=403, detail="Please log in again")
     if user.get("role") == "service_provider":
         raise HTTPException(status_code=403, detail="Service providers cannot request help")
-    service = body.get("service_type")
-    if service not in SERVICES:
+    service = (body.get("service_type") or "").strip()
+    target_listing = None
+    if body.get("target_provider"):
+        target_listing = await listings_collection.find_one({"email": (body.get("target_provider") or "").lower()})
+    allowed = SERVICES | set((target_listing or {}).get("custom_services", []))
+    if service not in allowed:
         raise HTTPException(status_code=400, detail="Choose what kind of help you need")
     try:
         lat, lng = float(body["lat"]), float(body["lng"])
@@ -333,6 +340,8 @@ async def cash_received(rid: str, body: dict):
     now = datetime.utcnow()
     await requests_collection.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed", "paid_at": now, "completedAt": now}})
     await listings_collection.update_one({"email": doc["provider"]["email"]}, {"$inc": {"jobs_done": 1}})
+    if doc.get("booking_id"):
+        await database.get_collection("bookings").update_one({"_id": ObjectId(doc["booking_id"])}, {"$set": {"status": "completed", "completedAt": now}})
     await transactions_collection.insert_many([
         {"email": doc["provider"]["email"], "type": "cash", "amount": doc["amount"], "service_request_id": rid,
          "description": f"Cash received – roadside {doc['service_type']}", "createdAt": now},
