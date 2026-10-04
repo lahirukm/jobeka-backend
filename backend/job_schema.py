@@ -17,6 +17,7 @@ class JobCreate(BaseModel):
     employer_name:  Optional[str]   = ""
     employer_phone: Optional[str]   = ""
     employer_email: Optional[str]   = ""   # ← NEW: identifies who posted
+    payment_method: Optional[str]   = "card"  # "card" (PayHere) or "cash" (paid by hand)
 
 
 class JobUpdate(BaseModel):
@@ -33,6 +34,7 @@ class JobUpdate(BaseModel):
     status:         Optional[str]   = None
     employer_name:  Optional[str]   = None  # ← NEW
     employer_phone: Optional[str]   = None  # ← NEW
+    payment_method: Optional[str]   = None  # "card" or "cash"
 
 
 class JobOut(BaseModel):

@@ -10,11 +10,7 @@ Flow
   6. Job amount added to worker's wallet  → GET  /api/wallet?email=
   7. Worker requests a bank withdrawal    → POST /api/wallet/withdraw  → admin approves / rejects
 """
-import os
-import re
-import base64
-import hashlib
-import secrets
+import os, re, base64, hashlib, secrets
 from datetime import datetime, timedelta
 
 import httpx
@@ -29,29 +25,26 @@ from database import database, jobs_collection
 load_dotenv()
 router = APIRouter(tags=["Payments & Wallet"])
 
-users_collection = database.get_collection("users")
-payments_collection = database.get_collection("payments")
+users_collection        = database.get_collection("users")
+payments_collection     = database.get_collection("payments")
 transactions_collection = database.get_collection("transactions")
-withdrawals_collection = database.get_collection("withdrawals")
+withdrawals_collection  = database.get_collection("withdrawals")
 
 # ── PayHere settings (.env)
-PAYHERE_MERCHANT_ID = os.getenv("PAYHERE_MERCHANT_ID", "")
+PAYHERE_MERCHANT_ID     = os.getenv("PAYHERE_MERCHANT_ID", "")
 PAYHERE_MERCHANT_SECRET = os.getenv("PAYHERE_MERCHANT_SECRET", "")
-# Business App (for Retrieval API)
-PAYHERE_APP_ID = os.getenv("PAYHERE_APP_ID", "")
-PAYHERE_APP_SECRET = os.getenv("PAYHERE_APP_SECRET", "")
-PAYHERE_SANDBOX = os.getenv("PAYHERE_SANDBOX", "true").lower() == "true"
+PAYHERE_APP_ID          = os.getenv("PAYHERE_APP_ID", "")       # Business App (for Retrieval API)
+PAYHERE_APP_SECRET      = os.getenv("PAYHERE_APP_SECRET", "")
+PAYHERE_SANDBOX         = os.getenv("PAYHERE_SANDBOX", "true").lower() == "true"
 # Public address of this backend (your laptop IP while testing, Render URL after deployment)
-PUBLIC_BASE_URL = os.getenv(
-    "PUBLIC_BASE_URL", "http://localhost:8001").rstrip("/")
+PUBLIC_BASE_URL         = os.getenv("PUBLIC_BASE_URL", "http://localhost:8001").rstrip("/")
 # Sandbox only: if the Retrieval API is not set up, trust PayHere's redirect to return_url.
-PAYHERE_TRUST_RETURN = os.getenv(
-    "PAYHERE_TRUST_RETURN", "false").lower() == "true"
+PAYHERE_TRUST_RETURN    = os.getenv("PAYHERE_TRUST_RETURN", "false").lower() == "true"
 
-PAYHERE_HOST = "https://sandbox.payhere.lk" if PAYHERE_SANDBOX else "https://www.payhere.lk"
-OTP_MINUTES = 10
+PAYHERE_HOST  = "https://sandbox.payhere.lk" if PAYHERE_SANDBOX else "https://www.payhere.lk"
+OTP_MINUTES   = 10
 OTP_MAX_TRIES = 5
-MIN_WITHDRAW = 500
+MIN_WITHDRAW  = 500
 
 
 # ─────────────────────────────── helpers
@@ -61,10 +54,8 @@ def _oid(value: str) -> ObjectId:
     except InvalidId:
         raise HTTPException(status_code=400, detail="Invalid id")
 
-
 def _hash_otp(job_id: str, otp: str) -> str:
     return hashlib.sha256(f"{job_id}:{otp}".encode()).hexdigest()
-
 
 def _amount_from_salary(salary) -> float:
     """'LKR 3,000/day' → 3000.0"""
@@ -75,19 +66,15 @@ def _amount_from_salary(salary) -> float:
     except ValueError:
         value = 0
     if value <= 0:
-        raise HTTPException(
-            status_code=400, detail="Job salary is not a valid amount. Edit the job and enter a number.")
+        raise HTTPException(status_code=400, detail="Job salary is not a valid amount. Edit the job and enter a number.")
     return round(value, 2)
-
 
 def _md5_upper(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest().upper()
 
-
 def _checkout_hash(order_id: str, amount: float) -> str:
     # PayHere: UPPER(MD5(merchant_id + order_id + amount + currency + UPPER(MD5(merchant_secret))))
     return _md5_upper(f"{PAYHERE_MERCHANT_ID}{order_id}{amount:.2f}LKR{_md5_upper(PAYHERE_MERCHANT_SECRET)}")
-
 
 def _clean(doc: dict) -> dict:
     d = dict(doc)
@@ -98,7 +85,6 @@ def _clean(doc: dict) -> dict:
         if isinstance(v, ObjectId):
             d[k] = str(v)
     return d
-
 
 async def _complete_payment(order: dict, payhere_payment_id: str = "", method: str = ""):
     """Mark the order paid and credit the worker's wallet (runs only once per order)."""
@@ -131,16 +117,15 @@ async def arrive(job_id: str, body: dict):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.get("status") != "applied":
-        raise HTTPException(
-            status_code=400, detail="This job is not in progress")
+        raise HTTPException(status_code=400, detail="This job is not in progress")
     worker_email = (body.get("email") or "").lower()
     applied_by = (job.get("appliedBy") or {}).get("email", "")
     if applied_by and worker_email and applied_by != worker_email:
-        raise HTTPException(
-            status_code=403, detail="Only the person who applied can mark arrival")
+        raise HTTPException(status_code=403, detail="Only the person who applied can mark arrival")
     if job.get("payment_status") == "paid":
-        raise HTTPException(
-            status_code=400, detail="This job has already been paid")
+        raise HTTPException(status_code=400, detail="This job has already been paid")
+    if (job.get("arrival") or {}).get("verified"):
+        raise HTTPException(status_code=400, detail="The employer has already verified your code")
 
     otp = f"{secrets.randbelow(10000):04d}"
     print(f"🔢 New arrival OTP for job {job_id} (valid {OTP_MINUTES} min)")
@@ -165,32 +150,32 @@ async def verify_otp(job_id: str, body: dict):
         raise HTTPException(status_code=404, detail="Job not found")
     employer_email = (body.get("employer_email") or "").lower()
     if job.get("employer_email") and employer_email != job["employer_email"].lower():
-        raise HTTPException(
-            status_code=403, detail="Only the employer who posted this job can verify the OTP")
+        raise HTTPException(status_code=403, detail="Only the employer who posted this job can verify the OTP")
 
     arrival = job.get("arrival") or {}
     if not arrival:
-        raise HTTPException(
-            status_code=400, detail="The worker has not marked arrival yet")
+        raise HTTPException(status_code=400, detail="The worker has not marked arrival yet")
 
     if not arrival.get("verified"):
         now = datetime.utcnow()
         if arrival.get("expires_at") and now > arrival["expires_at"]:
-            print(
-                f"⏰ OTP expired for job {job_id}: now(UTC)={now:%H:%M:%S} expired_at(UTC)={arrival['expires_at']:%H:%M:%S}")
-            raise HTTPException(
-                status_code=400, detail="OTP expired. Ask the worker for the new code on their screen.")
+            print(f"⏰ OTP expired for job {job_id}: now(UTC)={now:%H:%M:%S} expired_at(UTC)={arrival['expires_at']:%H:%M:%S}")
+            raise HTTPException(status_code=400, detail="OTP expired. Ask the worker for the new code on their screen.")
         if arrival.get("attempts", 0) >= OTP_MAX_TRIES:
-            raise HTTPException(
-                status_code=429, detail="Too many wrong attempts. Ask the worker for a new OTP.")
+            raise HTTPException(status_code=429, detail="Too many wrong attempts. Ask the worker for a new OTP.")
         if _hash_otp(job_id, str(body.get("otp", "")).strip()) != arrival.get("otp_hash"):
             await jobs_collection.update_one({"_id": job["_id"]}, {"$inc": {"arrival.attempts": 1}})
             print(f"❌ Wrong OTP for job {job_id}")
             left = OTP_MAX_TRIES - arrival.get("attempts", 0) - 1
-            raise HTTPException(
-                status_code=400, detail=f"Wrong OTP. {left} attempt(s) left.")
+            raise HTTPException(status_code=400, detail=f"Wrong OTP. {left} attempt(s) left.")
         await jobs_collection.update_one({"_id": job["_id"]}, {"$set": {
             "arrival.verified": True, "payment_status": "awaiting_payment"}})
+
+    # Cash job → no card payment. The employer now confirms handing over the cash.
+    if (job.get("payment_method") or "card") == "cash":
+        if job.get("payment_status") not in ("cash_confirm_pending", "paid"):
+            await jobs_collection.update_one({"_id": job["_id"]}, {"$set": {"payment_status": "awaiting_cash"}})
+        return {"method": "cash", "amount": _amount_from_salary(job.get("salary"))}
 
     # Reuse an unpaid order for this job if one exists (e.g. employer cancelled the card page)
     order = await payments_collection.find_one({"job_id": job_id, "status": {"$ne": "paid"}})
@@ -207,11 +192,63 @@ async def verify_otp(job_id: str, body: dict):
         }
         await payments_collection.insert_one(order)
     return {
+        "method": "card",
         "order_id": order["order_id"], "amount": order["amount"],
         "checkout_url": f"{PUBLIC_BASE_URL}/api/payments/checkout/{order['order_id']}",
         "return_url":   f"{PUBLIC_BASE_URL}/api/payments/return",
         "cancel_url":   f"{PUBLIC_BASE_URL}/api/payments/cancel",
     }
+
+
+# ─────────────────────────────── 2b. CASH: employer confirms cash handed over
+@router.post("/api/jobs/{job_id}/cash-paid")
+async def cash_paid(job_id: str, body: dict):
+    job = await jobs_collection.find_one({"_id": _oid(job_id)})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if (job.get("payment_method") or "card") != "cash":
+        raise HTTPException(status_code=400, detail="This job is paid by card")
+    employer_email = (body.get("employer_email") or "").lower()
+    if job.get("employer_email") and employer_email != job["employer_email"].lower():
+        raise HTTPException(status_code=403, detail="Only the employer who posted this job can confirm cash")
+    if not (job.get("arrival") or {}).get("verified"):
+        raise HTTPException(status_code=400, detail="Verify the worker's OTP first")
+    if job.get("payment_status") == "paid":
+        return {"status": "paid"}
+    amount = _amount_from_salary(job.get("salary"))
+    await jobs_collection.update_one({"_id": job["_id"]}, {"$set": {
+        "payment_status": "cash_confirm_pending", "cash_amount": amount, "cash_paid_at": datetime.utcnow()}})
+    print(f"💵 Employer confirmed cash LKR {amount} for job {job_id}")
+    return {"status": "cash_confirm_pending", "amount": amount}
+
+
+# ─────────────────────────────── 2c. CASH: worker confirms cash received
+@router.post("/api/jobs/{job_id}/cash-received")
+async def cash_received(job_id: str, body: dict):
+    job = await jobs_collection.find_one({"_id": _oid(job_id)})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    worker_email = (body.get("email") or "").lower()
+    applied_by = (job.get("appliedBy") or {}).get("email", "")
+    if applied_by and worker_email and applied_by != worker_email:
+        raise HTTPException(status_code=403, detail="Only the worker on this job can confirm")
+    if job.get("payment_status") == "paid":
+        return {"status": "paid", "amount": job.get("paid_amount")}
+    if job.get("payment_status") != "cash_confirm_pending":
+        raise HTTPException(status_code=400, detail="The employer has not confirmed the cash payment yet")
+    amount = job.get("cash_amount") or _amount_from_salary(job.get("salary"))
+    now = datetime.utcnow()
+    await jobs_collection.update_one({"_id": job["_id"]}, {"$set": {
+        "payment_status": "paid", "paid_amount": amount, "paid_at": now, "paid_method": "cash"}})
+    # Cash is already in the worker's hand → recorded in history, NOT added to the wallet balance
+    await transactions_collection.insert_many([
+        {"email": applied_by or worker_email, "type": "cash", "amount": amount, "job_id": job_id,
+         "description": f"Cash received for job: {job.get('title', 'Job')}", "createdAt": now},
+        {"email": job.get("employer_email", ""), "type": "cash_payment", "amount": amount, "job_id": job_id,
+         "description": f"Cash paid for job: {job.get('title', 'Job')}", "createdAt": now},
+    ])
+    print(f"✅ Worker confirmed cash LKR {amount} for job {job_id}")
+    return {"status": "paid", "amount": amount}
 
 
 # ─────────────────────────────── 3. PayHere checkout page (opened inside the app's WebView)
@@ -222,7 +259,7 @@ async def checkout_page(order_id: str):
         raise HTTPException(status_code=404, detail="Order not found")
     if not PAYHERE_MERCHANT_ID or not PAYHERE_MERCHANT_SECRET:
         return HTMLResponse("<h3>PayHere is not configured. Add PAYHERE_MERCHANT_ID and PAYHERE_MERCHANT_SECRET to .env</h3>", 500)
-    name = (order.get("employer_name") or "JobEka Employer").split(" ")
+    name  = (order.get("employer_name") or "JobEka Employer").split(" ")
     first, last = name[0], (" ".join(name[1:]) or "Employer")
     fields = {
         "merchant_id": PAYHERE_MERCHANT_ID,
@@ -239,8 +276,7 @@ async def checkout_page(order_id: str):
         "address":     "Sri Lanka", "city": "Colombo", "country": "Sri Lanka",
         "hash":        _checkout_hash(order_id, order["amount"]),
     }
-    inputs = "\n".join(
-        f'<input type="hidden" name="{k}" value="{v}">' for k, v in fields.items())
+    inputs = "\n".join(f'<input type="hidden" name="{k}" value="{v}">' for k, v in fields.items())
     return f"""<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>JobEka Payment</title></head>
 <body style="font-family:sans-serif;text-align:center;padding-top:80px;color:#334155">
@@ -253,7 +289,6 @@ async def checkout_page(order_id: str):
 async def payment_return(order_id: str = ""):
     return "<html><body style='font-family:sans-serif;text-align:center;padding-top:80px'>Payment completed. Returning to JobEka…</body></html>"
 
-
 @router.get("/api/payments/cancel", response_class=HTMLResponse)
 async def payment_cancel(order_id: str = ""):
     return "<html><body style='font-family:sans-serif;text-align:center;padding-top:80px'>Payment cancelled. Returning to JobEka…</body></html>"
@@ -263,13 +298,12 @@ async def payment_cancel(order_id: str = ""):
 @router.post("/api/payments/notify")
 async def payment_notify(request: Request):
     form = await request.form()
-    order_id = form.get("order_id", "")
-    amount = form.get("payhere_amount", "")
-    currency = form.get("payhere_currency", "")
+    order_id    = form.get("order_id", "")
+    amount      = form.get("payhere_amount", "")
+    currency    = form.get("payhere_currency", "")
     status_code = form.get("status_code", "")
-    md5sig = form.get("md5sig", "")
-    local = _md5_upper(
-        f"{PAYHERE_MERCHANT_ID}{order_id}{amount}{currency}{status_code}{_md5_upper(PAYHERE_MERCHANT_SECRET)}")
+    md5sig      = form.get("md5sig", "")
+    local = _md5_upper(f"{PAYHERE_MERCHANT_ID}{order_id}{amount}{currency}{status_code}{_md5_upper(PAYHERE_MERCHANT_SECRET)}")
     if local != md5sig:
         raise HTTPException(status_code=400, detail="Invalid signature")
     order = await payments_collection.find_one({"order_id": order_id})
@@ -285,8 +319,7 @@ async def _retrieve_payment(order_id: str):
     """PayHere Retrieval API (needs a Business App ID + Secret)."""
     if not (PAYHERE_APP_ID and PAYHERE_APP_SECRET):
         return None
-    basic = base64.b64encode(
-        f"{PAYHERE_APP_ID}:{PAYHERE_APP_SECRET}".encode()).decode()
+    basic = base64.b64encode(f"{PAYHERE_APP_ID}:{PAYHERE_APP_SECRET}".encode()).decode()
     async with httpx.AsyncClient(timeout=15) as client:
         tok = await client.post(f"{PAYHERE_HOST}/merchant/v1/oauth/token",
                                 headers={"Authorization": f"Basic {basic}"},
@@ -299,7 +332,6 @@ async def _retrieve_payment(order_id: str):
         res.raise_for_status()
         data = res.json().get("data") or []
         return data[0] if data else {}
-
 
 @router.post("/api/payments/{order_id}/confirm")
 async def confirm_payment(order_id: str):
@@ -322,7 +354,6 @@ async def confirm_payment(order_id: str):
         return {"status": "paid", "amount": order["amount"], "note": "sandbox: confirmed from return page"}
     return {"status": order.get("status", "pending"), "amount": order["amount"]}
 
-
 @router.get("/api/payments/by-job/{job_id}")
 async def payment_by_job(job_id: str):
     order = await payments_collection.find_one({"job_id": job_id}, sort=[("createdAt", -1)])
@@ -340,24 +371,19 @@ async def wallet(email: str):
     wds = [_clean(w) async for w in withdrawals_collection.find({"email": email}).sort("createdAt", -1).limit(20)]
     return {"balance": round(user.get("wallet_balance", 0), 2), "transactions": txs, "withdrawals": wds}
 
-
 @router.post("/api/wallet/withdraw")
 async def request_withdrawal(body: dict):
-    email = (body.get("email") or "").lower()
+    email   = (body.get("email") or "").lower()
     try:
         amount = round(float(body.get("amount", 0)), 2)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Enter a valid amount")
-    bank, branch = (body.get("bank_name") or "").strip(
-    ), (body.get("branch") or "").strip()
-    acc_name, acc_no = (body.get("account_name") or "").strip(), re.sub(
-        r"\s", "", body.get("account_number") or "")
+    bank, branch = (body.get("bank_name") or "").strip(), (body.get("branch") or "").strip()
+    acc_name, acc_no = (body.get("account_name") or "").strip(), re.sub(r"\s", "", body.get("account_number") or "")
     if amount < MIN_WITHDRAW:
-        raise HTTPException(
-            status_code=400, detail=f"Minimum withdrawal is LKR {MIN_WITHDRAW}")
+        raise HTTPException(status_code=400, detail=f"Minimum withdrawal is LKR {MIN_WITHDRAW}")
     if not (bank and acc_name and acc_no.isdigit() and 6 <= len(acc_no) <= 20):
-        raise HTTPException(
-            status_code=400, detail="Enter bank, account name and a valid account number")
+        raise HTTPException(status_code=400, detail="Enter bank, account name and a valid account number")
     # Deduct only if the balance is enough (atomic)
     res = await users_collection.update_one(
         {"email": email, "wallet_balance": {"$gte": amount}},
@@ -397,10 +423,8 @@ async def sandbox_test():
         "phone": "0771234567", "address": "Sri Lanka", "city": "Colombo", "country": "Sri Lanka",
         "hash": _checkout_hash(order_id, amount),
     }
-    rows = "".join(
-        f"<tr><td>{k}</td><td>{'(hidden)' if k == 'hash' else v}</td></tr>" for k, v in fields.items())
-    inputs = "".join(
-        f'<input type="hidden" name="{k}" value="{v}">' for k, v in fields.items())
+    rows = "".join(f"<tr><td>{k}</td><td>{'(hidden)' if k == 'hash' else v}</td></tr>" for k, v in fields.items())
+    inputs = "".join(f'<input type="hidden" name="{k}" value="{v}">' for k, v in fields.items())
     return f"""<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="font-family:sans-serif;padding:24px">
 <h3>PayHere sandbox test (LKR 100)</h3>
@@ -430,28 +454,23 @@ async def payhere_config_check():
 # ─────────────────────────────── 6. admin: withdrawal requests
 ADMIN_KEY = os.getenv("ADMIN_KEY", "jobeka_admin_2025")
 
-
 def _check_admin(key):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
-
 
 @router.get("/api/admin/withdrawals")
 async def admin_withdrawals(x_admin_key: str = Header(None)):
     _check_admin(x_admin_key)
     return [_clean(w) async for w in withdrawals_collection.find().sort("createdAt", -1)]
 
-
 @router.post("/api/admin/withdrawals/{wid}/{action}")
 async def admin_withdrawal_action(wid: str, action: str, x_admin_key: str = Header(None)):
     _check_admin(x_admin_key)
     if action not in ("approve", "reject"):
-        raise HTTPException(
-            status_code=400, detail="Action must be approve or reject")
+        raise HTTPException(status_code=400, detail="Action must be approve or reject")
     wd = await withdrawals_collection.find_one({"_id": _oid(wid)})
     if not wd or wd["status"] != "pending":
-        raise HTTPException(
-            status_code=400, detail="Request not found or already processed")
+        raise HTTPException(status_code=400, detail="Request not found or already processed")
     new_status = "paid" if action == "approve" else "rejected"
     await withdrawals_collection.update_one({"_id": wd["_id"]}, {"$set": {"status": new_status, "processedAt": datetime.utcnow()}})
     if action == "reject":  # give the money back to the wallet
