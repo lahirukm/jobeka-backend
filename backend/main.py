@@ -9,6 +9,7 @@ from ai_router    import router as ai_router
 from users_router import router as users_router
 from admin_router import router as admin_router
 from payments_router import router as payments_router
+from banners_router import router as banners_router
 
 
 @asynccontextmanager
@@ -39,6 +40,7 @@ app.include_router(jobs_router)   # /api/jobs/
 app.include_router(ai_router)     # /api/ai/
 app.include_router(admin_router)  # /api/admin/
 app.include_router(payments_router)  # arrival OTP, PayHere payments, wallet, withdrawals
+app.include_router(banners_router)   # home-screen promo banners
 
 
 @app.get("/")
