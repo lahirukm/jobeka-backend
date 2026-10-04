@@ -104,10 +104,18 @@ async def _complete_payment(order: dict, payhere_payment_id: str = "", method: s
         {"email": order["employer_email"], "type": "card_payment", "amount": amount, "job_id": order["job_id"],
          "description": f"Card payment for job: {order['job_title']}", "order_id": order["order_id"], "createdAt": now},
     ])
-    await jobs_collection.update_one(
-        {"_id": ObjectId(order["job_id"])},
-        {"$set": {"payment_status": "paid", "paid_amount": amount, "paid_at": now}},
-    )
+    if order.get("kind") == "service":
+        # on-demand service request (roadside help) → mark it completed
+        await database.get_collection("service_requests").update_one(
+            {"_id": ObjectId(order["job_id"])},
+            {"$set": {"status": "completed", "paid_method": "card", "paid_at": now, "completedAt": now}},
+        )
+        await database.get_collection("provider_listings").update_one({"email": order["worker_email"]}, {"$inc": {"jobs_done": 1}})
+    else:
+        await jobs_collection.update_one(
+            {"_id": ObjectId(order["job_id"])},
+            {"$set": {"payment_status": "paid", "paid_amount": amount, "paid_at": now}},
+        )
 
 
 # ─────────────────────────────── 1. worker arrives → OTP
