@@ -1,3 +1,4 @@
+import re
 from fastapi import APIRouter, HTTPException
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -103,6 +104,45 @@ async def get_all_active_jobs():
 
 
 # ── GET /api/jobs/{id}
+# ── GET /api/jobs/options?field=type|category&q= — values employers typed before (grows the dropdowns)
+@router.get("/options")
+async def job_options(field: str = "category", q: str = ""):
+    if field not in ("type", "category", "education_level", "required_skills", "languages"):
+        raise HTTPException(status_code=400, detail="Unknown field")
+    values = await jobs_collection.distinct(field)
+    seen, out = set(), []
+    for v in values:
+        if not isinstance(v, str) or not v.strip():
+            continue
+        k = v.strip().lower()
+        if k in seen or (q and q.lower() not in k):
+            continue
+        seen.add(k); out.append(v.strip())
+    return sorted(out)[:30]
+
+
+# ── GET /api/jobs/search?q=&type=&category= — job seekers search vacancies ("IT", "accountant", "react")
+@router.get("/search")
+async def search_jobs(q: str = "", type: str = "", category: str = "", exclude_part_time: bool = True):
+    query = {"status": "active"}
+    if type:
+        query["type"] = re.compile(f"^{re.escape(type)}$", re.I)
+    elif exclude_part_time:
+        query["type"] = {"$not": re.compile("^part time$", re.I)}
+    if category:
+        query["category"] = re.compile(f"^{re.escape(category)}$", re.I)
+    words = [w for w in re.split(r"\s+", q.strip().lower()) if w]
+    out = []
+    async for job in jobs_collection.find(query).sort("createdAt", -1):
+        text = " ".join([job.get("title", ""), job.get("category", ""), job.get("type", ""), job.get("location", ""),
+                         job.get("description", ""), job.get("requirements", ""), job.get("employer_name", ""),
+                         " ".join(job.get("required_skills") or [])]).lower()
+        # short words like "IT", "HR", "UI" must match a whole word (so "it" doesn't hit "city")
+        if all((re.search(rf"\b{re.escape(w)}\b", text) if len(w) <= 3 else w in text) for w in words):
+            out.append(job_to_dict(job))
+    return out
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: str):
     try:
