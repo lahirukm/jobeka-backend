@@ -29,6 +29,10 @@ users_collection        = database.get_collection("users")
 payments_collection     = database.get_collection("payments")
 transactions_collection = database.get_collection("transactions")
 withdrawals_collection  = database.get_collection("withdrawals")
+earnings_collection     = database.get_collection("platform_earnings")     # JobEka's commission
+
+# JobEka commission on every paid job / service (6% by default)
+COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.06"))
 
 # ── PayHere settings (.env)
 PAYHERE_MERCHANT_ID     = os.getenv("PAYHERE_MERCHANT_ID", "")
@@ -86,6 +90,44 @@ def _clean(doc: dict) -> dict:
             d[k] = str(v)
     return d
 
+
+# ─────────────────────────────── commission: one place for every payment
+async def settle_payment(kind: str, ref_id: str, title: str, gross: float, method: str,
+                         worker_email: str, payer_email: str, order_id: str = ""):
+    """Split a payment between the worker and JobEka.
+
+    card → the customer paid JobEka: worker wallet gets  gross − 6%
+    cash → the worker already holds the full amount:  wallet is charged the 6% fee
+           (balance can go below zero = commission the worker owes)
+    """
+    gross = round(float(gross), 2)
+    fee   = round(gross * COMMISSION_RATE, 2)
+    net   = round(gross - fee, 2)
+    now   = datetime.utcnow()
+    pct   = f"{COMMISSION_RATE * 100:g}%"
+    ref   = {"job_id": ref_id} if kind == "job" else {"service_request_id": ref_id}
+
+    if method == "card":
+        await users_collection.update_one({"email": worker_email}, {"$inc": {"wallet_balance": net}})
+        txs = [{"email": worker_email, "type": "credit", "amount": net, "gross": gross, "fee": fee, **ref,
+                "description": f"{title} · LKR {gross:,.0f} − {pct} JobEka fee", "order_id": order_id, "createdAt": now},
+               {"email": payer_email, "type": "card_payment", "amount": gross, **ref,
+                "description": f"Card payment · {title}", "order_id": order_id, "createdAt": now}]
+    else:
+        await users_collection.update_one({"email": worker_email}, {"$inc": {"wallet_balance": -fee}})
+        txs = [{"email": worker_email, "type": "cash", "amount": gross, **ref,
+                "description": f"Cash received · {title}", "createdAt": now},
+               {"email": worker_email, "type": "commission", "amount": fee, **ref,
+                "description": f"JobEka fee ({pct}) on cash job · {title}", "createdAt": now},
+               {"email": payer_email, "type": "cash_payment", "amount": gross, **ref,
+                "description": f"Cash paid · {title}", "createdAt": now}]
+    await transactions_collection.insert_many(txs)
+    await earnings_collection.insert_one({
+        "kind": kind, "ref_id": ref_id, "title": title, "method": method,
+        "gross": gross, "rate": COMMISSION_RATE, "commission": fee, "worker_net": net,
+        "worker_email": worker_email, "payer_email": payer_email, "createdAt": now})
+    return {"gross": gross, "fee": fee, "net": net}
+
 async def _complete_payment(order: dict, payhere_payment_id: str = "", method: str = ""):
     """Mark the order paid and credit the worker's wallet (runs only once per order)."""
     res = await payments_collection.update_one(
@@ -96,19 +138,15 @@ async def _complete_payment(order: dict, payhere_payment_id: str = "", method: s
     if res.modified_count == 0:
         return  # already processed
     amount = order["amount"]
-    await users_collection.update_one({"email": order["worker_email"]}, {"$inc": {"wallet_balance": amount}})
     now = datetime.utcnow()
-    await transactions_collection.insert_many([
-        {"email": order["worker_email"],   "type": "credit", "amount": amount, "job_id": order["job_id"],
-         "description": f"Payment for job: {order['job_title']}", "order_id": order["order_id"], "createdAt": now},
-        {"email": order["employer_email"], "type": "card_payment", "amount": amount, "job_id": order["job_id"],
-         "description": f"Card payment for job: {order['job_title']}", "order_id": order["order_id"], "createdAt": now},
-    ])
+    split = await settle_payment("service" if order.get("kind") == "service" else "job", order["job_id"], order["job_title"],
+                                 amount, "card", order["worker_email"], order["employer_email"], order["order_id"])
     if order.get("kind") == "service":
         # on-demand service request (roadside help) → mark it completed
         await database.get_collection("service_requests").update_one(
             {"_id": ObjectId(order["job_id"])},
-            {"$set": {"status": "completed", "paid_method": "card", "paid_at": now, "completedAt": now}},
+            {"$set": {"status": "completed", "paid_method": "card", "paid_at": now, "completedAt": now,
+                      "commission": split["fee"], "provider_net": split["net"]}},
         )
         await database.get_collection("provider_listings").update_one({"email": order["worker_email"]}, {"$inc": {"jobs_done": 1}})
         sr = await database.get_collection("service_requests").find_one({"_id": ObjectId(order["job_id"])})
@@ -117,7 +155,8 @@ async def _complete_payment(order: dict, payhere_payment_id: str = "", method: s
     else:
         await jobs_collection.update_one(
             {"_id": ObjectId(order["job_id"])},
-            {"$set": {"payment_status": "paid", "paid_amount": amount, "paid_at": now}},
+            {"$set": {"payment_status": "paid", "paid_amount": amount, "paid_at": now,
+                      "commission": split["fee"], "worker_net": split["net"]}},
         )
 
 
@@ -249,17 +288,13 @@ async def cash_received(job_id: str, body: dict):
         raise HTTPException(status_code=400, detail="The employer has not confirmed the cash payment yet")
     amount = job.get("cash_amount") or _amount_from_salary(job.get("salary"))
     now = datetime.utcnow()
+    split = await settle_payment("job", job_id, job.get("title", "Job"), amount, "cash",
+                                 applied_by or worker_email, job.get("employer_email", ""))
     await jobs_collection.update_one({"_id": job["_id"]}, {"$set": {
-        "payment_status": "paid", "paid_amount": amount, "paid_at": now, "paid_method": "cash"}})
-    # Cash is already in the worker's hand → recorded in history, NOT added to the wallet balance
-    await transactions_collection.insert_many([
-        {"email": applied_by or worker_email, "type": "cash", "amount": amount, "job_id": job_id,
-         "description": f"Cash received for job: {job.get('title', 'Job')}", "createdAt": now},
-        {"email": job.get("employer_email", ""), "type": "cash_payment", "amount": amount, "job_id": job_id,
-         "description": f"Cash paid for job: {job.get('title', 'Job')}", "createdAt": now},
-    ])
-    print(f"✅ Worker confirmed cash LKR {amount} for job {job_id}")
-    return {"status": "paid", "amount": amount}
+        "payment_status": "paid", "paid_amount": amount, "paid_at": now, "paid_method": "cash",
+        "commission": split["fee"], "worker_net": split["net"]}})
+    print(f"✅ Worker confirmed cash LKR {amount} for job {job_id} (fee {split['fee']})")
+    return {"status": "paid", "amount": amount, "commission": split["fee"], "net": split["net"]}
 
 
 # ─────────────────────────────── 3. PayHere checkout page (opened inside the app's WebView)
@@ -401,6 +436,9 @@ async def request_withdrawal(body: dict):
         {"$inc": {"wallet_balance": -amount}},
     )
     if res.modified_count == 0:
+        u = await users_collection.find_one({"email": email}) or {}
+        if u.get("wallet_balance", 0) < 0:
+            raise HTTPException(status_code=400, detail="Your balance is negative because of JobEka fees on cash jobs. It will clear with your next card payment.")
         raise HTTPException(status_code=400, detail="Insufficient balance")
     now = datetime.utcnow()
     wd = {"email": email, "amount": amount, "bank_name": bank, "branch": branch,
@@ -468,6 +506,39 @@ ADMIN_KEY = os.getenv("ADMIN_KEY", "jobeka_admin_2025")
 def _check_admin(key):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
+
+@router.get("/api/admin/revenue")
+async def admin_revenue(x_admin_key: str = Header(None)):
+    """JobEka commission totals for the admin dashboard."""
+    _check_admin(x_admin_key)
+    now = datetime.utcnow()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month = today.replace(day=1)
+    t = {"total": 0, "today": 0, "month": 0, "gross": 0, "count": 0,
+         "by_kind": {"job": 0, "service": 0}, "by_method": {"card": 0, "cash": 0}}
+    days = {}
+    async for e in earnings_collection.find():
+        c = e.get("commission", 0); d = e.get("createdAt", now)
+        t["total"] += c; t["gross"] += e.get("gross", 0); t["count"] += 1
+        t["by_kind"][e.get("kind", "job")] = t["by_kind"].get(e.get("kind", "job"), 0) + c
+        t["by_method"][e.get("method", "card")] = t["by_method"].get(e.get("method", "card"), 0) + c
+        if d >= today: t["today"] += c
+        if d >= month: t["month"] += c
+        key = d.strftime("%Y-%m-%d"); days[key] = days.get(key, 0) + c
+    # cash fees not yet recovered = negative wallet balances
+    owed = 0
+    async for u in users_collection.find({"wallet_balance": {"$lt": 0}}, {"wallet_balance": 1}):
+        owed += -u["wallet_balance"]
+    recent = [_clean(e) async for e in earnings_collection.find().sort("createdAt", -1).limit(30)]
+    r2 = lambda v: round(v, 2)
+    return {
+        "rate": COMMISSION_RATE, "total": r2(t["total"]), "today": r2(t["today"]), "month": r2(t["month"]),
+        "gross": r2(t["gross"]), "count": t["count"],
+        "by_kind": {k: r2(v) for k, v in t["by_kind"].items()}, "by_method": {k: r2(v) for k, v in t["by_method"].items()},
+        "cash_fees_owed": r2(owed), "daily": [{"date": k, "commission": r2(v)} for k, v in sorted(days.items())][-30:],
+        "recent": recent,
+    }
+
 
 @router.get("/api/admin/withdrawals")
 async def admin_withdrawals(x_admin_key: str = Header(None)):

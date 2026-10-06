@@ -342,12 +342,10 @@ async def cash_received(rid: str, body: dict):
     await listings_collection.update_one({"email": doc["provider"]["email"]}, {"$inc": {"jobs_done": 1}})
     if doc.get("booking_id"):
         await database.get_collection("bookings").update_one({"_id": ObjectId(doc["booking_id"])}, {"$set": {"status": "completed", "completedAt": now}})
-    await transactions_collection.insert_many([
-        {"email": doc["provider"]["email"], "type": "cash", "amount": doc["amount"], "service_request_id": rid,
-         "description": f"Cash received – roadside {doc['service_type']}", "createdAt": now},
-        {"email": doc["customer_email"], "type": "cash_payment", "amount": doc["amount"], "service_request_id": rid,
-         "description": f"Cash paid – roadside {doc['service_type']}", "createdAt": now},
-    ])
+    from payments_router import settle_payment            # 6% JobEka commission
+    split = await settle_payment("service", rid, f"{doc['service_type'].replace('_', ' ').title()} service", doc["amount"], "cash",
+                                 doc["provider"]["email"], doc["customer_email"])
+    await requests_collection.update_one({"_id": doc["_id"]}, {"$set": {"commission": split["fee"], "provider_net": split["net"]}})
     return {"status": "completed"}
 
 
