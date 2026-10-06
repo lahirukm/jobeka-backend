@@ -540,6 +540,44 @@ async def admin_revenue(x_admin_key: str = Header(None)):
     }
 
 
+@router.get("/api/admin/finance")
+async def admin_finance(x_admin_key: str = Header(None)):
+    """Where the money is: what should be in JobEka's bank, how much of it belongs to
+    workers, and how much is JobEka's own profit (before PayHere's fees)."""
+    _check_admin(x_admin_key)
+    card_collected = 0.0; card_count = 0
+    async for p in payments_collection.find({"status": "paid"}, {"amount": 1}):
+        card_collected += p.get("amount", 0); card_count += 1
+    wallets_owed = 0.0; workers_with_balance = 0; fees_to_recover = 0.0
+    async for u in users_collection.find({"wallet_balance": {"$ne": 0}}, {"wallet_balance": 1}):
+        b = u.get("wallet_balance", 0)
+        if b > 0: wallets_owed += b; workers_with_balance += 1
+        else: fees_to_recover += -b
+    pending = paid_out = 0.0; pending_count = 0
+    async for w in withdrawals_collection.find({"status": {"$in": ["pending", "paid"]}}, {"amount": 1, "status": 1}):
+        if w["status"] == "pending": pending += w["amount"]; pending_count += 1
+        else: paid_out += w["amount"]
+    commission = 0.0
+    async for e in earnings_collection.find({}, {"commission": 1}):
+        commission += e.get("commission", 0)
+    in_bank      = card_collected - paid_out                 # card money received − payouts already sent
+    owed_workers = wallets_owed + pending                    # still belongs to workers
+    profit_now   = in_bank - owed_workers                    # JobEka's own money in the bank
+    r2 = lambda v: round(v, 2)
+    return {
+        "card_collected": r2(card_collected), "card_count": card_count,
+        "paid_out": r2(paid_out),
+        "expected_in_bank": r2(in_bank),
+        "wallets_owed": r2(wallets_owed), "workers_with_balance": workers_with_balance,
+        "pending_withdrawals": r2(pending), "pending_count": pending_count,
+        "owed_to_workers": r2(owed_workers),
+        "available_profit": r2(profit_now),
+        "commission_earned": r2(commission),
+        "fees_to_recover": r2(fees_to_recover),       # cash-job fees not yet collected
+        "rate": COMMISSION_RATE,
+    }
+
+
 @router.get("/api/admin/withdrawals")
 async def admin_withdrawals(x_admin_key: str = Header(None)):
     _check_admin(x_admin_key)
