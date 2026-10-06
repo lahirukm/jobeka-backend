@@ -22,6 +22,35 @@ from fastapi import APIRouter, HTTPException
 
 from database import database
 
+
+# Words people may type for each service (English + common Sri Lankan terms)
+SERVICE_WORDS = {
+    "mechanic": "mechanic car repair engine garage vehicle breakdown van jeep bike",
+    "battery": "battery dead jump start car battery",
+    "tyre": "tyre tire puncture flat wheel tube",
+    "towing": "towing tow truck breakdown recovery accident",
+    "fuel": "fuel petrol diesel empty tank",
+    "lockout": "key lockout locked keys car lock",
+    "auto_electric": "auto electrician car wiring lights starter alternator",
+    "plumber": "plumber pipe leak water tap toilet drain bathroom",
+    "electrician": "electrician wiring power light switch fuse electrical",
+    "ac_repair": "ac air conditioner aircon repair service gas fridge refrigerator",
+    "carpenter": "carpenter wood furniture door window cupboard",
+    "painter": "painter painting wall paint house",
+    "cleaning": "cleaning cleaner house office deep clean",
+    "mason": "mason bass construction cement tiles building wall",
+    "three_wheeler": "three wheeler tuk tuk taxi hire ride",
+    "lorry": "lorry truck hire transport goods",
+    "courier": "courier delivery parcel document send",
+    "moving": "house moving shifting movers relocation",
+    "phone_repair": "phone repair mobile screen display battery smartphone",
+    "computer_repair": "computer laptop repair pc printer software",
+    "cctv": "cctv camera security installation",
+    "tutor": "tutor tuition teacher class lessons maths english",
+    "beautician": "beautician salon makeup hair bridal",
+    "tailor": "tailor sewing dress stitching clothes",
+}
+
 router = APIRouter(prefix="/api", tags=["Find help (directory & bookings)"])
 listings_collection  = database.get_collection("provider_listings")
 providers_collection = database.get_collection("provider_status")
@@ -158,11 +187,28 @@ async def delete_listing(email: str):
 
 
 # ─────────────────────────── customer: find help near me
+@router.get("/services/suggest")
+async def suggest_services(q: str = ""):
+    """Services that providers typed themselves (not in the fixed list), matching what the customer types.
+    This is how the list grows to cover any service in the world."""
+    q = q.strip().lower()
+    counts = {}
+    async for l in listings_collection.find({"custom_services": {"$exists": True, "$ne": []}}, {"custom_services": 1}):
+        for c in l.get("custom_services", []):
+            if not q or q in c.lower():
+                key = c.strip().lower()
+                name, n = counts.get(key, (c.strip(), 0))
+                counts[key] = (name, n + 1)
+    items = sorted(counts.values(), key=lambda x: (-x[1], x[0]))[:8]
+    return [{"name": n, "providers": c} for n, c in items]
+
+
 @router.get("/listings/nearby")
 async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: str = "", radius: float = 25):
     query = {"published": {"$ne": False}}
-    if service:
-        query["$or"] = [{"services": service}, {"custom_services": service}]
+    if service:   # list service id, or a provider-typed service (any capitalisation)
+        query["$or"] = [{"services": service},
+                        {"custom_services": {"$regex": f"^{re.escape(service.strip())}$", "$options": "i"}}]
     elif group:
         query["groups"] = group
     listings = [l async for l in listings_collection.find(query)]
@@ -178,7 +224,8 @@ async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: 
             continue
         if q:
             text = " ".join([l.get("business_name", ""), l.get("description", ""), l.get("area", ""),
-                             " ".join(l.get("services", [])).replace("_", " "), " ".join(l.get("custom_services", []))]).lower()
+                             " ".join(SERVICE_WORDS.get(x, x) for x in l.get("services", [])).replace("_", " "),
+                             " ".join(l.get("custom_services", []))]).lower()
             if q.lower() not in text:
                 continue
         out.append(_public(l, l["email"] in online, d, live if live and live[0] is not None else None))
