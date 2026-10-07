@@ -12,6 +12,7 @@ from payments_router import router as payments_router
 from banners_router import router as banners_router
 from providers_router import router as providers_router
 from service_router import router as service_router
+from applications_router import router as applications_router
 
 
 @asynccontextmanager
@@ -44,6 +45,7 @@ app.include_router(admin_router)  # /api/admin/
 app.include_router(payments_router)  # arrival OTP, PayHere payments, wallet, withdrawals
 app.include_router(banners_router)   # home-screen promo banners
 app.include_router(providers_router) # Find Help Near Me: listings + bookings
+app.include_router(applications_router)  # full-time job applications
 app.include_router(service_router)   # on-demand "Request now" (customer ↔ service provider)
 
 

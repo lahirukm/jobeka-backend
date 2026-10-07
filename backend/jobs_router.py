@@ -187,6 +187,8 @@ async def apply_job(job_id: str, body: dict):
     job = await jobs_collection.find_one({"_id": oid})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if (job.get("type") or "Part Time").strip().lower() != "part time":
+        raise HTTPException(status_code=400, detail="This is not a part-time job. Please update the app to apply.")
 
     if job.get("status") in ("applied", "closed"):
         raise HTTPException(status_code=400, detail="This job is already taken")
