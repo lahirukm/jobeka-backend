@@ -1,10 +1,12 @@
 import re
-from fastapi import APIRouter, HTTPException
-from bson import ObjectId
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import Response
+from bson import ObjectId, Binary
 from bson.errors import InvalidId
 from datetime import datetime
 
-from database import jobs_collection
+from database import jobs_collection, database
+job_banners_collection = database.get_collection("job_banners")   # optional job banner images
 from job_schema import JobCreate, JobUpdate
 
 router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
@@ -105,6 +107,55 @@ async def get_all_active_jobs():
 
 # ── GET /api/jobs/{id}
 # ── GET /api/jobs/options?field=type|category&q= — values employers typed before (grows the dropdowns)
+# ── Job banner image (optional, full-time posts). Stored in MongoDB because Render's disk is wiped on deploy.
+BANNER_TYPES = {"image/png", "image/jpeg", "image/webp"}
+
+@router.post("/{job_id}/banner")
+async def upload_job_banner(job_id: str, file: UploadFile = File(...), employer_email: str = Form("")):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = await jobs_collection.find_one({"_id": oid})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("employer_email") and employer_email.lower() != job["employer_email"].lower():
+        raise HTTPException(status_code=403, detail="Not your job")
+    if file.content_type not in BANNER_TYPES:
+        raise HTTPException(status_code=400, detail="Use a PNG, JPEG or WEBP image")
+    data = await file.read()
+    if len(data) > 3 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image is larger than 3 MB")
+    await job_banners_collection.update_one({"job_id": job_id},
+        {"$set": {"job_id": job_id, "image": Binary(data), "content_type": file.content_type, "updatedAt": datetime.utcnow()}}, upsert=True)
+    url = f"/api/jobs/{job_id}/banner?v={int(datetime.utcnow().timestamp())}"
+    await jobs_collection.update_one({"_id": oid}, {"$set": {"banner_url": url}})
+    return {"banner_url": url}
+
+@router.get("/{job_id}/banner")
+async def get_job_banner(job_id: str):
+    b = await job_banners_collection.find_one({"job_id": job_id})
+    if not b:
+        raise HTTPException(status_code=404, detail="No banner")
+    return Response(content=bytes(b["image"]), media_type=b.get("content_type", "image/jpeg"),
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+@router.delete("/{job_id}/banner")
+async def delete_job_banner(job_id: str, employer_email: str = ""):
+    try:
+        oid = ObjectId(job_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = await jobs_collection.find_one({"_id": oid})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("employer_email") and employer_email.lower() != job["employer_email"].lower():
+        raise HTTPException(status_code=403, detail="Not your job")
+    await job_banners_collection.delete_one({"job_id": job_id})
+    await jobs_collection.update_one({"_id": oid}, {"$unset": {"banner_url": ""}})
+    return {"ok": True}
+
+
 @router.get("/options")
 async def job_options(field: str = "category", q: str = ""):
     if field not in ("type", "category", "education_level", "required_skills", "languages"):
@@ -119,6 +170,19 @@ async def job_options(field: str = "category", q: str = ""):
             continue
         seen.add(k); out.append(v.strip())
     return sorted(out)[:30]
+
+
+# ── GET /api/jobs/categories — categories that have active full-time/contract jobs (filter chips)
+@router.get("/categories")
+async def active_categories():
+    counts = {}
+    async for job in jobs_collection.find({"status": "active", "type": {"$not": re.compile("^part time$", re.I)}}, {"category": 1}):
+        c = (job.get("category") or "").strip()
+        if c:
+            key = c.lower()
+            name, n = counts.get(key, (c, 0))
+            counts[key] = (name, n + 1)
+    return [{"name": n, "count": c} for n, c in sorted(counts.values(), key=lambda x: (-x[1], x[0]))]
 
 
 # ── GET /api/jobs/search?q=&type=&category= — job seekers search vacancies ("IT", "accountant", "react")
@@ -137,8 +201,8 @@ async def search_jobs(q: str = "", type: str = "", category: str = "", exclude_p
         text = " ".join([job.get("title", ""), job.get("category", ""), job.get("type", ""), job.get("location", ""),
                          job.get("description", ""), job.get("requirements", ""), job.get("employer_name", ""),
                          " ".join(job.get("required_skills") or [])]).lower()
-        # short words like "IT", "HR", "UI" must match a whole word (so "it" doesn't hit "city")
-        if all((re.search(rf"\b{re.escape(w)}\b", text) if len(w) <= 3 else w in text) for w in words):
+        # short words must match the START of a word: "ma" → "Management", "it" → "IT" (but not "city")
+        if all((re.search(rf"\b{re.escape(w)}", text) if len(w) <= 3 else w in text) for w in words):
             out.append(job_to_dict(job))
     return out
 
