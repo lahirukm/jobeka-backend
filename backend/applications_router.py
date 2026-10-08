@@ -24,6 +24,7 @@ from database import database, jobs_collection
 router = APIRouter(prefix="/api", tags=["Full-time applications"])
 applications_collection = database.get_collection("applications")
 users_collection        = database.get_collection("users")
+cv_collection           = database.get_collection("cv_profiles")
 
 STATUSES = ("applied", "shortlisted", "rejected", "hired")
 
@@ -66,7 +67,9 @@ async def apply(job_id: str, body: dict):
         raise HTTPException(status_code=400, detail="You have already applied to this job")
 
     now = datetime.utcnow()
+    saved_cv = await cv_collection.find_one({"email": email})      # the applicant's CV (made in the CV builder)
     doc = {
+        "cv": (saved_cv or {}).get("cv"), "cv_template": (saved_cv or {}).get("template", "modern"),
         "job_id": job_id, "job_title": job.get("title", ""), "job_type": job.get("type", ""),
         "company": job.get("employer_name", ""), "employer_email": (job.get("employer_email") or "").lower(),
         "email": email,
@@ -123,7 +126,14 @@ async def job_applications(job_id: str, employer_email: str):
     if (job.get("employer_email") or "").lower() != employer_email.lower():
         raise HTTPException(status_code=403, detail="Not your job")
     order = {"hired": 0, "shortlisted": 1, "applied": 2, "rejected": 3}
-    items = [_out(a) async for a in applications_collection.find({"job_id": job_id, "status": {"$ne": "withdrawn"}})]
+    items = []
+    async for a in applications_collection.find({"job_id": job_id, "status": {"$ne": "withdrawn"}}):
+        d = _out(a)
+        d["has_cv"] = bool(a.get("cv"))
+        d["headline"] = (a.get("cv") or {}).get("headline", "")
+        d["skills"] = (a.get("cv") or {}).get("skills", [])[:6]
+        d.pop("cv", None)                                   # full CV is opened separately
+        items.append(d)
     items.sort(key=lambda a: (order.get(a["status"], 9), a["createdAt"]))
     return items
 
