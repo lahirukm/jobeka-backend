@@ -15,6 +15,7 @@ from providers_router import router as providers_router
 from service_router import router as service_router
 from applications_router import router as applications_router
 from cv_router import router as cv_router
+from account_router import router as account_router
 
 
 @asynccontextmanager
@@ -50,6 +51,7 @@ app.include_router(home_services_router)  # home "Popular services" tiles (PNG i
 app.include_router(providers_router) # Find Help Near Me: listings + bookings
 app.include_router(applications_router)  # full-time job applications
 app.include_router(cv_router)            # CV builder (AI + templates)
+app.include_router(account_router)       # saved jobs, notifications, privacy & security, help & support
 app.include_router(service_router)   # on-demand "Request now" (customer ↔ service provider)
 
 
