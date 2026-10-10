@@ -13,6 +13,8 @@ Seeker:   POST   /api/jobs/{job_id}/applications        apply with the JobEka CV
           DELETE /api/applications/{aid}?email=         withdraw (while still "applied")
 Employer: GET    /api/jobs/{job_id}/applications?employer_email=
           PATCH  /api/applications/{aid}                {employer_email, status}
+          POST   /api/applications/{aid}/schedule       interview or first working day (date, time, place / online link)
+Seeker:   POST   /api/applications/{aid}/respond        {email, kind, response: accepted|reschedule, note}
 """
 import re
 from datetime import datetime
@@ -39,7 +41,9 @@ CV_TYPES = {
     "image/jpeg": "jpg", "image/png": "png",
 }
 
-STATUSES = ("applied", "shortlisted", "rejected", "hired")
+STATUSES = ("applied", "shortlisted", "interview", "rejected", "hired")
+DATE_RE  = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+TIME_RE  = re.compile(r"^\d{2}:\d{2}$")
 
 
 def _oid(v):
@@ -182,7 +186,7 @@ async def job_applications(job_id: str, employer_email: str):
         raise HTTPException(status_code=404, detail="Job not found")
     if (job.get("employer_email") or "").lower() != employer_email.lower():
         raise HTTPException(status_code=403, detail="Not your job")
-    order = {"hired": 0, "shortlisted": 1, "applied": 2, "rejected": 3}
+    order = {"hired": 0, "interview": 1, "shortlisted": 2, "applied": 3, "rejected": 4}
     items = []
     async for a in applications_collection.find({"job_id": job_id, "status": {"$ne": "withdrawn"}}):
         d = _out(a)
@@ -208,3 +212,65 @@ async def set_status(aid: str, body: dict):
         raise HTTPException(status_code=400, detail="Invalid status")
     await applications_collection.update_one({"_id": a["_id"]}, {"$set": {"status": status, "updatedAt": datetime.utcnow()}})
     return {"status": status}
+
+
+# ─────────────────────────── interview / first working day
+@router.post("/applications/{aid}/schedule")
+async def schedule(aid: str, body: dict):
+    """kind = "interview" (status → interview) or "joining" (status → hired).
+       mode = "in_person" (address + optional lat/lng) or "online" (meeting link)."""
+    a = await applications_collection.find_one({"_id": _oid(aid)})
+    if not a:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if a["employer_email"] != (body.get("employer_email") or "").lower():
+        raise HTTPException(status_code=403, detail="Not your job")
+    kind = body.get("kind") if body.get("kind") in ("interview", "joining") else "interview"
+    mode = "online" if (body.get("mode") == "online" and kind == "interview") else "in_person"
+    date_, time_ = (body.get("date") or "").strip(), (body.get("time") or "").strip()
+    if not DATE_RE.match(date_) or not TIME_RE.match(time_):
+        raise HTTPException(status_code=400, detail="Choose a date and time")
+    if date_ < datetime.utcnow().strftime("%Y-%m-%d"):
+        raise HTTPException(status_code=400, detail="That date is already over")
+    ev = {"mode": mode, "date": date_, "time": time_, "note": (body.get("note") or "").strip()[:500],
+          "contact_name": (body.get("contact_name") or "").strip()[:60], "contact_phone": (body.get("contact_phone") or "").strip()[:20],
+          "response": "pending", "response_note": "", "sentAt": datetime.utcnow()}
+    if mode == "online":
+        link = (body.get("meeting_link") or "").strip()[:300]
+        if not link:
+            raise HTTPException(status_code=400, detail="Add the meeting link (Zoom, Google Meet, Teams…)")
+        ev["meeting_link"] = link if link.startswith(("http://", "https://")) else "https://" + link
+    else:
+        addr = (body.get("address") or "").strip()[:300]
+        if not addr:
+            raise HTTPException(status_code=400, detail="Add the address / place")
+        ev["address"] = addr
+        try:
+            lat, lng = float(body.get("lat")), float(body.get("lng"))
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                ev["lat"], ev["lng"] = lat, lng
+        except (TypeError, ValueError):
+            pass
+    status = "interview" if kind == "interview" else "hired"
+    now = datetime.utcnow()
+    await applications_collection.update_one({"_id": a["_id"]}, {"$set": {kind: ev, "status": status, "updatedAt": now}})
+    print(f"📅 {kind} set for {a['email']} → {a.get('job_title')} on {date_} {time_}")
+    return _out(await applications_collection.find_one({"_id": a["_id"]}))
+
+
+@router.post("/applications/{aid}/respond")
+async def respond(aid: str, body: dict):
+    a = await applications_collection.find_one({"_id": _oid(aid)})
+    if not a or a["email"] != (body.get("email") or "").lower():
+        raise HTTPException(status_code=404, detail="Application not found")
+    kind = body.get("kind") if body.get("kind") in ("interview", "joining") else "interview"
+    if not a.get(kind):
+        raise HTTPException(status_code=400, detail="Nothing to respond to")
+    resp = body.get("response")
+    if resp not in ("accepted", "reschedule"):
+        raise HTTPException(status_code=400, detail="Invalid response")
+    note = (body.get("note") or "").strip()[:300]
+    if resp == "reschedule" and len(note) < 3:
+        raise HTTPException(status_code=400, detail="Tell the employer which day / time suits you")
+    await applications_collection.update_one({"_id": a["_id"]}, {"$set": {
+        f"{kind}.response": resp, f"{kind}.response_note": note, f"{kind}.respondedAt": datetime.utcnow()}})
+    return _out(await applications_collection.find_one({"_id": a["_id"]}))

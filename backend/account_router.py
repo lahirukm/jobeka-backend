@@ -104,7 +104,8 @@ async def unsave_job(job_id: str, user_id: str = Depends(get_current_user)):
 # ─────────────────────────── notifications
 APP_TEXT = {
     "shortlisted": ("You're shortlisted! 🎉", "{company} shortlisted you for {title}. They may contact you soon.", "star", "#F59E0B"),
-    "hired":       ("You got the job! 🥳",   "{company} hired you for {title}. Congratulations!",                 "trophy", "#16A34A"),
+    "interview":   ("Interview invitation 📅", "{company} invited you to an interview for {title}. Check the date & place.", "calendar", "#7C3AED"),
+    "hired":       ("You got the job! 🥳",   "{company} hired you for {title}. See your first working day.",      "trophy", "#16A34A"),
     "rejected":    ("Application update",    "{company} chose another candidate for {title}. Keep applying!",      "close-circle", "#64748B"),
 }
 
@@ -126,7 +127,7 @@ async def notifications(user_id: str = Depends(get_current_user)):
             items.append({"id": f"app-{a['_id']}-{a['status']}", "kind": "applications", "title": t,
                           "body": body.format(company=a.get("company") or "The employer", title=a.get("job_title") or "the job"),
                           "icon": icon, "color": color, "at": a["updatedAt"],
-                          "link": {"path": "/(tabs)/activity"}})
+                          "link": {"path": "/my-applications"}})
 
     if prefs["payments"]:
         TX = {
