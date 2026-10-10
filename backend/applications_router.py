@@ -6,7 +6,9 @@ Different from part-time jobs:
   • no tracking, no arrival code, no payment through the app
   • the employer reviews applicants: Shortlist → Hire, or Reject
 
-Seeker:   POST   /api/jobs/{job_id}/applications        apply
+Seeker:   POST   /api/jobs/{job_id}/applications        apply with the JobEka CV (built in the app)
+          POST   /api/jobs/{job_id}/applications/file   apply with own CV file (multipart: file, email, name, phone, message)
+          GET    /api/applications/{aid}/cv-file?email= | ?employer_email=   open the uploaded CV
           GET    /api/applications/mine?email=          my applications (+ job info)
           DELETE /api/applications/{aid}?email=         withdraw (while still "applied")
 Employer: GET    /api/jobs/{job_id}/applications?employer_email=
@@ -17,7 +19,9 @@ from datetime import datetime
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, HTTPException
+from bson import Binary
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import Response
 
 from database import database, jobs_collection
 
@@ -25,6 +29,15 @@ router = APIRouter(prefix="/api", tags=["Full-time applications"])
 applications_collection = database.get_collection("applications")
 users_collection        = database.get_collection("users")
 cv_collection           = database.get_collection("cv_profiles")
+cv_files_collection     = database.get_collection("cv_files")       # CVs uploaded from the phone (PDF / Word / photo)
+
+CV_MAX   = 5 * 1024 * 1024
+CV_TYPES = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "image/jpeg": "jpg", "image/png": "png",
+}
 
 STATUSES = ("applied", "shortlisted", "rejected", "hired")
 
@@ -48,8 +61,7 @@ def _out(a):
 
 
 # ─────────────────────────── seeker applies
-@router.post("/jobs/{job_id}/applications")
-async def apply(job_id: str, body: dict):
+async def _check_and_build(job_id: str, body: dict, attach_saved_cv: bool):
     job = await jobs_collection.find_one({"_id": _oid(job_id)})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -67,22 +79,67 @@ async def apply(job_id: str, body: dict):
         raise HTTPException(status_code=400, detail="You have already applied to this job")
 
     now = datetime.utcnow()
-    saved_cv = await cv_collection.find_one({"email": email})      # the applicant's CV (made in the CV builder)
+    saved_cv = await cv_collection.find_one({"email": email}) if attach_saved_cv else None   # the CV made in the CV builder
     doc = {
         "cv": (saved_cv or {}).get("cv"), "cv_template": (saved_cv or {}).get("template", "modern"),
+        "cv_source": "jobeka" if attach_saved_cv else "file",
         "job_id": job_id, "job_title": job.get("title", ""), "job_type": job.get("type", ""),
         "company": job.get("employer_name", ""), "employer_email": (job.get("employer_email") or "").lower(),
         "email": email,
         "name":  (body.get("name") or user.get("name", "")).strip()[:80],
-        "phone": (body.get("phone") or user.get("phone", "")).strip()[:20],
+        "phone": (user.get("phone") or body.get("phone") or "").strip()[:20],     # registered (verified) number
         "message": (body.get("message") or "").strip()[:1000],
         "status": "applied", "createdAt": now, "updatedAt": now,
     }
+    return job, doc
+
+async def _save(job, doc):
     res = await applications_collection.insert_one(doc)
     await jobs_collection.update_one({"_id": job["_id"]}, {"$inc": {"applicants": 1}})
     doc["_id"] = res.inserted_id
-    print(f"📨 Application: {email} → {job.get('title')}")
+    print(f"📨 Application ({doc['cv_source']}): {doc['email']} → {job.get('title')}")
+    return doc
+
+@router.post("/jobs/{job_id}/applications")
+async def apply(job_id: str, body: dict):
+    job, doc = await _check_and_build(job_id, body, attach_saved_cv=True)
+    return _out(await _save(job, doc))
+
+
+@router.post("/jobs/{job_id}/applications/file")
+async def apply_with_file(job_id: str, file: UploadFile = File(...), email: str = Form(...), name: str = Form(""),
+                          phone: str = Form(""), message: str = Form("")):
+    ctype = (file.content_type or "").lower()
+    if ctype not in CV_TYPES:
+        raise HTTPException(status_code=400, detail="Upload your CV as PDF, Word (.doc/.docx) or a photo (JPG/PNG)")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    if len(data) > CV_MAX:
+        raise HTTPException(status_code=400, detail="CV file is larger than 5 MB")
+    job, doc = await _check_and_build(job_id, {"email": email, "name": name, "phone": phone, "message": message}, attach_saved_cv=False)
+    fname = (file.filename or f"cv.{CV_TYPES[ctype]}").replace("/", "_")[-80:]
+    doc["cv_file"] = {"name": fname, "type": ctype, "size": len(data)}
+    doc = await _save(job, doc)
+    await cv_files_collection.insert_one({"application_id": str(doc["_id"]), "email": doc["email"], "name": fname,
+                                         "content_type": ctype, "data": Binary(data), "createdAt": doc["createdAt"]})
     return _out(doc)
+
+
+@router.get("/applications/{aid}/cv-file")
+async def open_cv_file(aid: str, email: str = "", employer_email: str = ""):
+    a = await applications_collection.find_one({"_id": _oid(aid)})
+    if not a:
+        raise HTTPException(status_code=404, detail="Application not found")
+    allowed = (email and email.lower() == a["email"]) or (employer_email and employer_email.lower() == a["employer_email"])
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    f = await cv_files_collection.find_one({"application_id": aid})
+    if not f:
+        raise HTTPException(status_code=404, detail="No CV file for this application")
+    safe = re.sub(r'[^A-Za-z0-9._ -]', "_", f["name"])
+    return Response(content=bytes(f["data"]), media_type=f["content_type"],
+                    headers={"Content-Disposition": f'inline; filename="{safe}"', "Cache-Control": "private, max-age=300"})
 
 
 @router.get("/applications/mine")
@@ -130,6 +187,7 @@ async def job_applications(job_id: str, employer_email: str):
     async for a in applications_collection.find({"job_id": job_id, "status": {"$ne": "withdrawn"}}):
         d = _out(a)
         d["has_cv"] = bool(a.get("cv"))
+        d["has_cv_file"] = bool(a.get("cv_file"))
         d["headline"] = (a.get("cv") or {}).get("headline", "")
         d["skills"] = (a.get("cv") or {}).get("skills", [])[:6]
         d.pop("cv", None)                                   # full CV is opened separately

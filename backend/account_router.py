@@ -224,6 +224,7 @@ async def delete_account(body: dict, user_id: str = Depends(get_current_user)):
     for col in ("saved_jobs", "avatars"):
         await database.get_collection(col).delete_many({"user_id": user_id})
     await database.get_collection("cv_profiles").delete_many({"email": email})
+    await database.get_collection("cv_files").delete_many({"email": email})
     await applications_collection.update_many({"email": email, "status": "applied"}, {"$set": {"status": "withdrawn"}})
     await users_collection.delete_one({"_id": u["_id"]})
     print(f"🗑️ Account deleted: {email}")
