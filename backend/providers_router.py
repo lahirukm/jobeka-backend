@@ -71,6 +71,19 @@ ONLINE_TTL_MIN = 10
 SL_OFFSET = timedelta(hours=5, minutes=30)   # Sri Lanka time
 
 
+# Where the work happens: "mobile" = provider comes to you, "shop" = you go to the shop
+SHOP_SERVICES = {"phone_repair", "tailor"}
+BOTH_SERVICES = {"computer_repair", "beautician", "tutor", "mechanic", "auto_electric", "ac_repair"}
+MODES = ("mobile", "shop", "both")
+
+def _default_mode(services):
+    s = set(services or [])
+    if s and s <= SHOP_SERVICES:
+        return "shop"
+    if s & (SHOP_SERVICES | BOTH_SERVICES):
+        return "both"
+    return "mobile"
+
 def _oid(v):
     try:
         return ObjectId(v)
@@ -108,7 +121,9 @@ async def _online_map(emails):
 def _public(l, online=False, distance=None, live=None):
     d = {k: v for k, v in l.items() if k not in ("_id",)}
     d["_id"] = str(l["_id"])
-    if live:                                   # online → show where the provider is right now
+    d["service_mode"] = l.get("service_mode") or _default_mode(l.get("services"))
+    d["shop_lat"], d["shop_lng"] = l.get("lat"), l.get("lng")          # the fixed place (shop / base)
+    if live and d["service_mode"] != "shop":   # mobile providers online → where they are right now
         d["lat"], d["lng"] = live
     d["all_services"] = list(l.get("services", [])) + list(l.get("custom_services", []))
     d["online"] = online
@@ -142,6 +157,8 @@ async def save_listing(body: dict):
         raise HTTPException(status_code=400, detail="Enter your business or display name")
     if not services and not custom:
         raise HTTPException(status_code=400, detail="Choose or type at least one service")
+    if body.get("service_mode") in ("shop", "both") and not (body.get("address") or "").strip():
+        raise HTTPException(status_code=400, detail="Add your shop address so customers can find you")
     try:
         lat, lng = float(body["lat"]), float(body["lng"])
     except (KeyError, TypeError, ValueError):
@@ -159,6 +176,8 @@ async def save_listing(body: dict):
         "services": services, "custom_services": custom,
         "groups": sorted({GROUP_OF[s] for s in services} | ({"other"} if custom else set())),
         "lat": lat, "lng": lng, "area": (body.get("area") or "")[:80],
+        "service_mode": body.get("service_mode") if body.get("service_mode") in MODES else _default_mode(services),
+        "address": (body.get("address") or "").strip()[:200],          # shop address / landmark
         "radius_km": 25,
         "hours": hours,
         "price_from": max(0, int(float(body.get("price_from") or 0))),
@@ -216,6 +235,9 @@ async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: 
     out = []
     for l in listings:
         live = online.get(l["email"])
+        mode = l.get("service_mode") or _default_mode(l.get("services"))
+        if mode == "shop":
+            live = None                                   # a shop doesn't move
         pos = live if live and live[0] is not None else (l.get("lat"), l.get("lng"))
         if pos[0] is None:
             continue
@@ -223,14 +245,15 @@ async def nearby(lat: float, lng: float, service: str = "", group: str = "", q: 
         if d > radius:
             continue
         if q:
-            text = " ".join([l.get("business_name", ""), l.get("description", ""), l.get("area", ""),
+            text = " ".join([l.get("business_name", ""), l.get("description", ""), l.get("area", ""), l.get("address", ""),
                              " ".join(SERVICE_WORDS.get(x, x) for x in l.get("services", [])).replace("_", " "),
                              " ".join(l.get("custom_services", []))]).lower()
             if q.lower() not in text:
                 continue
         out.append(_public(l, l["email"] in online, d, live if live and live[0] is not None else None))
-    # 🟢 online first, then open now, then nearest
-    out.sort(key=lambda x: (not x["online"], not x["open_now"], x["distance_km"]))
+    # available first (online, or a shop that is open now), then open now, then nearest
+    ready = lambda x: x["online"] or (x["service_mode"] in ("shop", "both") and x["open_now"])
+    out.sort(key=lambda x: (not ready(x), not x["open_now"], x["distance_km"]))
     return out
 
 @router.get("/listings/{lid}")
