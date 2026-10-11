@@ -103,8 +103,8 @@ async def unsave_job(job_id: str, user_id: str = Depends(get_current_user)):
 
 # ─────────────────────────── notifications
 APP_TEXT = {
-    "shortlisted": ("You're shortlisted! 🎉", "{company} shortlisted you for {title}. They may contact you soon.", "star", "#F59E0B"),
-    "interview":   ("Interview invitation 📅", "{company} invited you to an interview for {title}. Check the date & place.", "calendar", "#7C3AED"),
+    "shortlisted": ("You're selected for the next round! 🎉", "{company} shortlisted you for {title}. Your interview date is coming soon.", "star", "#F59E0B"),
+    "interview":   ("Interview invitation 📅", "{company} invited you to an interview for {title}. Check the date, time & place.", "calendar", "#7C3AED"),
     "hired":       ("You got the job! 🥳",   "{company} hired you for {title}. See your first working day.",      "trophy", "#16A34A"),
     "rejected":    ("Application update",    "{company} chose another candidate for {title}. Keep applying!",      "close-circle", "#64748B"),
 }
@@ -124,7 +124,9 @@ async def notifications(user_id: str = Depends(get_current_user)):
     if prefs["applications"]:
         async for a in applications_collection.find({"email": email, "status": {"$in": list(APP_TEXT)}, "updatedAt": {"$gte": since}}):
             t, body, icon, color = APP_TEXT[a["status"]]
-            items.append({"id": f"app-{a['_id']}-{a['status']}", "kind": "applications", "title": t,
+            ev = a.get("interview") if a["status"] == "interview" else a.get("joining") if a["status"] == "hired" else None
+            stamp = int((ev or {}).get("sentAt", a["updatedAt"]).timestamp()) if ev else 0
+            items.append({"id": f"app-{a['_id']}-{a['status']}-{stamp}", "kind": "applications", "title": t,
                           "body": body.format(company=a.get("company") or "The employer", title=a.get("job_title") or "the job"),
                           "icon": icon, "color": color, "at": a["updatedAt"],
                           "link": {"path": "/my-applications"}})

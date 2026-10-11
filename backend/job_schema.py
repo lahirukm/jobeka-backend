@@ -23,6 +23,7 @@ class JobCreate(BaseModel):
     experience_years: Optional[float]     = 0
     education_level:  Optional[str]       = ""
     languages:        Optional[List[str]] = []
+    interview_mode:   Optional[str]       = "in_person"   # full-time: "online" (video) or "in_person" (at the company)
 
 
 class JobUpdate(BaseModel):
@@ -44,6 +45,7 @@ class JobUpdate(BaseModel):
     experience_years: Optional[float]     = None
     education_level:  Optional[str]       = None
     languages:        Optional[List[str]] = None
+    interview_mode:   Optional[str]       = None
 
 
 class JobOut(BaseModel):
