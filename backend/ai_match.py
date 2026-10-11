@@ -44,6 +44,45 @@ EDU_WORDS = [
     (2, ("a/l", "a.l", "advanced level", "gce a")),
     (1, ("o/l", "o.l", "ordinary level", "gce o")),
 ]
+# Job fields — so a carpenter's CV doesn't "match" a Software Engineer job just because the job has no skill list
+FIELDS = {
+    "it":           "software developer programmer engineer coding code computer react python java javascript typescript node sql database web mobile app android ios frontend backend fullstack full-stack devops cloud network networking system qa tester testing php laravel flutter html css data analyst machine learning cyber security",
+    "accounting":   "accountant accounting accounts finance financial audit auditor tax bookkeeping quickbooks payroll bank banking cashier teller credit loan insurance aat cima acca",
+    "sales":        "sales marketing salesman sales representative promoter business development digital marketing seo social media advertising brand merchandiser",
+    "teaching":     "teacher teaching tutor lecturer instructor education school classes tuition trainer",
+    "health":       "nurse nursing doctor medical hospital pharmacist pharmacy caregiver care giver health clinic midwife lab technician physiotherapist",
+    "hospitality":  "hotel chef cook cooking kitchen waiter waitress steward housekeeping receptionist tourism tour guide restaurant barista bakery baker",
+    "construction": "construction carpenter carpentry wood woodwork furniture joinery mason masonry plumber plumbing electrician wiring welder welding painter painting tiling tile builder site supervisor quantity surveyor civil",
+    "driving":      "driver driving delivery rider courier logistics transport lorry van bus three wheeler tuk forklift warehouse store keeper",
+    "mechanic":     "mechanic mechanical vehicle auto automobile motor engine repair technician garage service ac refrigeration",
+    "design":       "designer design graphic photoshop illustrator figma ui ux video editor editing photographer photography animation creative content writer",
+    "admin":        "admin administrative office assistant secretary clerk data entry receptionist hr human resources coordinator manager management",
+    "customer":     "customer service call center call centre support agent helpdesk",
+    "security":     "security guard watchman bouncer cctv",
+    "cleaning":     "cleaner cleaning janitor housekeeper laundry sweeper",
+    "beauty":       "beautician salon hair dresser hairdresser makeup barber spa",
+    "garment":      "tailor tailoring garment sewing machine operator textile fashion",
+    "agriculture":  "agriculture farm farmer farming plantation gardener gardening estate tea rubber",
+}
+FIELD_WORDS = {f: [w.strip() for w in re.split(r"\s{1}", ws) if w.strip()] for f, ws in FIELDS.items()}
+
+def fields_in(text: str) -> dict:
+    """{field: number of keyword hits} for a piece of normalised text."""
+    t = f" {text} "
+    out = {}
+    for f, words in FIELD_WORDS.items():
+        n = sum(1 for w in set(words) if f" {w} " in t or (len(w) > 4 and w in t))
+        if n:
+            out[f] = n
+    return out
+
+def main_fields(text: str) -> set:
+    h = fields_in(text)
+    if not h:
+        return set()
+    top = max(h.values())
+    return {f for f, n in h.items() if n >= max(1, top - 1)}
+
 STOP = {"and", "the", "for", "with", "job", "work", "staff", "assistant", "part", "time", "full", "a", "of", "in", "to"}
 
 
@@ -150,6 +189,9 @@ async def person(email: str) -> dict:
         "email": email, "name": user.get("name") or cv.get("full_name") or "",
         "skills": skills, "text": _norm(text), "languages": [_norm(l) for l in cv.get("languages") or []],
         "edu": _edu_level(edu_text), "years": _cv_years(cv.get("experience")),
+        "experience": [(_norm(f"{e.get('title','')} {e.get('company','')} {e.get('description','')} {' '.join(e.get('bullets') or [])}"),
+                        _cv_years([e])) for e in cv.get("experience") or []],
+        "fields": main_fields(_norm(text)),
         "expected_salary": _money(cv.get("expected_salary")),
         "has_cv": bool(cv), "busy": pt_busy > 0,
         "completed": completed, "cancelled": cancelled, "no_show": no_show,
@@ -157,24 +199,58 @@ async def person(email: str) -> dict:
     }
 
 
+def job_fields(job: dict) -> set:
+    return main_fields(_norm(f"{job.get('title','')} {job.get('title','')} {job.get('category','')} {' '.join(job.get('required_skills') or [])}"))
+
+def same_field(job: dict, p: dict):
+    """True / False when both sides have a clear field, None when we can't tell."""
+    jf = job_fields(job)
+    if not jf or not p["fields"]:
+        return None
+    return bool(jf & p["fields"])
+
 def _skills(job: dict, p: dict):
     req = [s for s in job.get("required_skills") or [] if str(s).strip()]
+    field = same_field(job, p)
     if req:
         have = [s for s in req if _has(p["text"], s)]
-        return len(have) / len(req), have, [s for s in req if s not in have]
-    # no skill list → compare the job's title / category words with the person's CV
+        ratio = len(have) / len(req)
+        if field is False:
+            ratio = min(ratio, 0.2)                      # a stray word match from another trade
+        return ratio, have, [s for s in req if s not in have]
+    # no skill list → is the CV in the same field as the job (IT, construction, accounting…)?
+    if field is True:
+        return 0.8, [], []
+    if field is False:
+        return 0.05, [], []
     words = _words(f"{job.get('title','')} {job.get('category','')}")
     if not words or not p["text"]:
-        return 0.5, [], []
+        return 0.4, [], []
     hit = [w for w in words if w in p["text"]]
-    return min(1.0, 0.3 + 0.7 * len(hit) / len(words)), hit, []
+    return round(0.2 + 0.6 * len(hit) / len(words), 3), hit, []
+
+def relevant_years(job: dict, p: dict) -> float:
+    """Only experience in the job's field counts (11 years as a carpenter ≠ software experience)."""
+    jf = job_fields(job)
+    keys = [_norm(s) for s in job.get("required_skills") or []] + list(_words(job.get("title", "")))
+    total = 0.0
+    for text, yrs in p["experience"]:
+        f = main_fields(text)
+        if (jf and f & jf) or any(k and k in text for k in keys):
+            total += yrs
+    return total
 
 
 # ─────────────────────────── features + prediction
 def full_time_features(job: dict, p: dict):
     skill, have, missing = _skills(job, p)
     need_years = float(job.get("experience_years") or 0)
-    exp = 1.0 if need_years <= 0 else min(1.0, p["years"] / need_years)
+    rel_years = relevant_years(job, p)
+    field = same_field(job, p)
+    if need_years > 0:
+        exp = min(1.0, rel_years / need_years)
+    else:                                               # job asks for no experience
+        exp = 1.0 if (rel_years > 0 or skill >= 0.5) else (0.3 if field is False else 0.6)
     pay = _money(job.get("salary"))
     sal = 0.8 if not (pay and p["expected_salary"]) else (1.0 if pay >= p["expected_salary"] else max(0.0, pay / p["expected_salary"]))
     need_edu = _job_edu(job.get("education_level"))
@@ -192,8 +268,12 @@ def full_time_features(job: dict, p: dict):
     if req:
         reasons.append(("good" if skill >= 0.67 else "warn" if skill >= 0.34 else "bad",
                         f"Has {len(have)} of {len(req)} skills" + (f" · missing {', '.join(missing[:3])}" if missing else "")))
+    if field is False:
+        reasons.insert(0, ("bad", "CV is from a different field than this job"))
+    elif field is True and not req:
+        reasons.insert(0, ("good", "CV is in the same field as this job"))
     if need_years > 0:
-        reasons.append(("good" if exp >= 1 else "warn", f"{p['years']:g} yrs experience (needs {need_years:g})"))
+        reasons.append(("good" if exp >= 1 else "warn", f"{rel_years:g} yrs relevant experience (needs {need_years:g})"))
     if need_edu:
         reasons.append(("good" if edu >= 1 else "warn", "Education matches" if edu >= 1 else f"Needs {job.get('education_level')}"))
     if langs:
@@ -209,6 +289,8 @@ def full_time_features(job: dict, p: dict):
 
 def part_time_features(job: dict, p: dict, lat=None, lng=None):
     skill, have, _ = _skills(job, p)
+    if not job.get("required_skills") and same_field(job, p) is False:
+        skill = 0.4          # short gigs (cleaning, delivery…) — anyone can do them, just not a specialist fit
     d = km(lat, lng, job.get("latitude"), job.get("longitude"))
     f = {
         "distance_km": d if d is not None else 10.0,
@@ -251,6 +333,10 @@ async def match(job: dict, p: dict, lat=None, lng=None):
         return None
     f, reasons = part_time_features(job, p, lat, lng) if pt else full_time_features(job, p)
     out = predict(model, f)
+    # knock-out rule before the ML ranking: a CV from a completely different field
+    # (e.g. a carpenter for a Software Engineer job) is never shown as a match
+    if not pt and same_field(job, p) is False and f["skill_match"] < 0.25:
+        out.update({"score": min(out["score"], 15), "prediction": 0, "label": LABELS[0], "gated": True})
     out["model"] = "part_time" if pt else "full_time"
     out["features"] = f
     out["reasons"] = [{"tone": t, "text": x} for t, x in reasons]
