@@ -21,6 +21,7 @@ Part-time model (5 features)
 """
 import math
 import re
+from difflib import SequenceMatcher
 from datetime import datetime
 
 import pandas as pd
@@ -46,7 +47,7 @@ EDU_WORDS = [
 ]
 # Job fields — so a carpenter's CV doesn't "match" a Software Engineer job just because the job has no skill list
 FIELDS = {
-    "it":           "software developer programmer engineer coding code computer react python java javascript typescript node sql database web mobile app android ios frontend backend fullstack full-stack devops cloud network networking system qa tester testing php laravel flutter html css data analyst machine learning cyber security",
+    "it":           "software developer programmer engineer coding code computer it support technical support helpdesk hardware windows linux react python java javascript typescript node sql database web mobile app android ios frontend backend fullstack full-stack devops cloud network networking system qa tester testing php laravel flutter html css data analyst machine learning cyber security",
     "accounting":   "accountant accounting accounts finance financial audit auditor tax bookkeeping quickbooks payroll bank banking cashier teller credit loan insurance aat cima acca",
     "sales":        "sales marketing salesman sales representative promoter business development digital marketing seo social media advertising brand merchandiser",
     "teaching":     "teacher teaching tutor lecturer instructor education school classes tuition trainer",
@@ -66,18 +67,26 @@ FIELDS = {
 }
 FIELD_WORDS = {f: [w.strip() for w in re.split(r"\s{1}", ws) if w.strip()] for f, ws in FIELDS.items()}
 
-def fields_in(text: str) -> dict:
+def _close(token: str, word: str) -> bool:
+    """typo-tolerant: 'enginer' ≈ 'engineer', 'sofware' ≈ 'software' (only for words of 5+ letters)"""
+    return len(word) >= 6 and token != word and not token.startswith(word) and abs(len(token) - len(word)) <= 2 and token[0] == word[0] \
+        and SequenceMatcher(None, token, word).ratio() >= 0.88
+
+def fields_in(text: str, fuzzy: bool = False) -> dict:
     """{field: number of keyword hits} for a piece of normalised text."""
     t = f" {text} "
+    tokens = set(text.split()) if fuzzy else set()
     out = {}
     for f, words in FIELD_WORDS.items():
-        n = sum(1 for w in set(words) if f" {w} " in t or (len(w) > 4 and w in t))
+        n = sum(1 for w in set(words)
+                if re.search(rf"(?<![a-z]){re.escape(w)}(s|es|ing|ed)?(?![a-z])", t)
+                or (fuzzy and " " not in w and any(_close(tk, w) for tk in tokens)))
         if n:
             out[f] = n
     return out
 
-def main_fields(text: str) -> set:
-    h = fields_in(text)
+def main_fields(text: str, fuzzy: bool = False) -> set:
+    h = fields_in(text, fuzzy)
     if not h:
         return set()
     top = max(h.values())
@@ -192,6 +201,7 @@ async def person(email: str) -> dict:
         "experience": [(_norm(f"{e.get('title','')} {e.get('company','')} {e.get('description','')} {' '.join(e.get('bullets') or [])}"),
                         _cv_years([e])) for e in cv.get("experience") or []],
         "fields": main_fields(_norm(text)),
+        "roles": _norm(" ".join([cv.get("headline", "")] + [e.get("title", "") for e in cv.get("experience") or []])),
         "expected_salary": _money(cv.get("expected_salary")),
         "has_cv": bool(cv), "busy": pt_busy > 0,
         "completed": completed, "cancelled": cancelled, "no_show": no_show,
@@ -200,7 +210,13 @@ async def person(email: str) -> dict:
 
 
 def job_fields(job: dict) -> set:
-    return main_fields(_norm(f"{job.get('title','')} {job.get('title','')} {job.get('category','')} {' '.join(job.get('required_skills') or [])}"))
+    """The job's field from its title (counted twice), category and skills — typo tolerant;
+       falls back to the description / requirements when those say nothing."""
+    head = _norm(f"{job.get('title','')} {job.get('title','')} {job.get('category','')} {' '.join(job.get('required_skills') or [])}")
+    f = main_fields(head, fuzzy=True)
+    if not f:
+        f = main_fields(_norm(f"{job.get('description','')} {job.get('requirements','')}"))
+    return f
 
 def same_field(job: dict, p: dict):
     """True / False when both sides have a clear field, None when we can't tell."""
@@ -208,6 +224,36 @@ def same_field(job: dict, p: dict):
     if not jf or not p["fields"]:
         return None
     return bool(jf & p["fields"])
+
+GENERIC = {"assistant", "senior", "junior", "trainee", "intern", "officer", "executive", "staff", "helper", "lead", "head",
+           "associate", "level", "grade", "entry", "worker", "needed", "wanted", "urgent", "vacancy"}
+
+ROLE_SYN = [
+    {"developer", "engineer", "programmer", "coder", "dev"},
+    {"accountant", "accounts", "accounting", "bookkeeper"},
+    {"teacher", "tutor", "lecturer", "instructor", "trainer"},
+    {"cook", "chef"}, {"driver", "chauffeur", "rider"},
+    {"designer", "artist"}, {"nurse", "caregiver", "carer"},
+    {"cashier", "teller"}, {"technician", "support", "helpdesk"},
+    {"carpenter", "joiner", "woodworker"}, {"salesman", "sales", "representative", "rep"},
+]
+
+def _syn(word: str) -> set:
+    for g in ROLE_SYN:
+        if word in g:
+            return g
+    return {word}
+
+def same_role(job: dict, p: dict) -> bool:
+    """Has the person already held this kind of role? (title words vs CV headline + past job titles, typo tolerant)"""
+    words = [w for w in _words(job.get("title", "")) if w not in GENERIC]
+    toks = set(p.get("roles", "").split())
+    if not words or not toks:
+        return False
+    def found(w):
+        return any(x in toks for x in _syn(w)) or (len(w) >= 5 and any(t.startswith(w[:5]) for t in toks)) \
+            or any(_close(t, w) for t in toks)
+    return sum(1 for w in words if found(w)) / len(words) >= 0.5
 
 def _skills(job: dict, p: dict):
     req = [s for s in job.get("required_skills") or [] if str(s).strip()]
@@ -218,9 +264,9 @@ def _skills(job: dict, p: dict):
         if field is False:
             ratio = min(ratio, 0.2)                      # a stray word match from another trade
         return ratio, have, [s for s in req if s not in have]
-    # no skill list → is the CV in the same field as the job (IT, construction, accounting…)?
+    # no skill list → same field (IT, construction, accounting…)? and the same role (Software Engineer ↔ Software Engineer)?
     if field is True:
-        return 0.8, [], []
+        return (0.9 if same_role(job, p) else 0.55), [], []
     if field is False:
         return 0.05, [], []
     words = _words(f"{job.get('title','')} {job.get('category','')}")
@@ -233,11 +279,17 @@ def relevant_years(job: dict, p: dict) -> float:
     """Only experience in the job's field counts (11 years as a carpenter ≠ software experience)."""
     jf = job_fields(job)
     keys = [_norm(s) for s in job.get("required_skills") or []] + list(_words(job.get("title", "")))
+    title_words = [w for w in _words(job.get("title", "")) if w not in GENERIC]
     total = 0.0
     for text, yrs in p["experience"]:
-        f = main_fields(text)
-        if (jf and f & jf) or any(k and k in text for k in keys):
-            total += yrs
+        toks = set(text.split())
+        role = bool(title_words) and sum(1 for w in title_words
+                                         if any(x in toks for x in _syn(w)) or any(_close(t, w) for t in toks)) / len(title_words) >= 0.5
+        skill_hit = any(k and k in text for k in keys if len(k) > 3)
+        if role or skill_hit:
+            total += yrs                                 # same role → full years
+        elif jf and main_fields(text) & jf:
+            total += yrs * 0.5                           # same field, other role → half
     return total
 
 
@@ -250,7 +302,8 @@ def full_time_features(job: dict, p: dict):
     if need_years > 0:
         exp = min(1.0, rel_years / need_years)
     else:                                               # job asks for no experience
-        exp = 1.0 if (rel_years > 0 or skill >= 0.5) else (0.3 if field is False else 0.6)
+        exp = (1.0 if same_role(job, p) or skill >= 0.8 else 0.65) if (rel_years > 0 or skill >= 0.5) \
+              else (0.3 if field is False else 0.6)
     pay = _money(job.get("salary"))
     sal = 0.8 if not (pay and p["expected_salary"]) else (1.0 if pay >= p["expected_salary"] else max(0.0, pay / p["expected_salary"]))
     need_edu = _job_edu(job.get("education_level"))
@@ -271,7 +324,10 @@ def full_time_features(job: dict, p: dict):
     if field is False:
         reasons.insert(0, ("bad", "CV is from a different field than this job"))
     elif field is True and not req:
-        reasons.insert(0, ("good", "CV is in the same field as this job"))
+        if same_role(job, p):
+            reasons.insert(0, ("good", "Has worked in this same role before"))
+        else:
+            reasons.insert(0, ("warn", "Same field, but a different role from the CV"))
     if need_years > 0:
         reasons.append(("good" if exp >= 1 else "warn", f"{rel_years:g} yrs relevant experience (needs {need_years:g})"))
     if need_edu:
