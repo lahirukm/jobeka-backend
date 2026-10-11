@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 
 from database import database, jobs_collection
+from video_service import create_room, join_url, _key as video_key
 
 router = APIRouter(prefix="/api", tags=["Full-time applications"])
 applications_collection = database.get_collection("applications")
@@ -235,10 +236,18 @@ async def schedule(aid: str, body: dict):
           "contact_name": (body.get("contact_name") or "").strip()[:60], "contact_phone": (body.get("contact_phone") or "").strip()[:20],
           "response": "pending", "response_note": "", "sentAt": datetime.utcnow()}
     if mode == "online":
-        link = (body.get("meeting_link") or "").strip()[:300]
-        if not link:
-            raise HTTPException(status_code=400, detail="Add the meeting link (Zoom, Google Meet, Teams…)")
-        ev["meeting_link"] = link if link.startswith(("http://", "https://")) else "https://" + link
+        if body.get("video") == "jobeka":
+            # in-app video room (Daily private room, or free Jitsi link without a key)
+            same = (a.get(kind) or {}).get("video")
+            keep = (same and (a.get(kind) or {}).get("date") == date_ and (a.get(kind) or {}).get("time") == time_
+                    and not (same.get("provider") == "jitsi" and video_key()))     # upgrade to Daily once a key is added
+            ev["video"] = same if keep else await create_room(date_, time_, a.get("company") or a.get("job_title") or "")
+            ev["meeting_link"] = "jobeka-video"
+        else:
+            link = (body.get("meeting_link") or "").strip()[:300]
+            if not link:
+                raise HTTPException(status_code=400, detail="Add the meeting link (Zoom, Google Meet, Teams…)")
+            ev["meeting_link"] = link if link.startswith(("http://", "https://")) else "https://" + link
     else:
         addr = (body.get("address") or "").strip()[:300]
         if not addr:
@@ -274,3 +283,22 @@ async def respond(aid: str, body: dict):
     await applications_collection.update_one({"_id": a["_id"]}, {"$set": {
         f"{kind}.response": resp, f"{kind}.response_note": note, f"{kind}.respondedAt": datetime.utcnow()}})
     return _out(await applications_collection.find_one({"_id": a["_id"]}))
+
+
+# ─────────────────────────── join the in-app video interview
+@router.get("/applications/{aid}/video")
+async def video_join(aid: str, email: str = "", employer_email: str = ""):
+    a = await applications_collection.find_one({"_id": _oid(aid)})
+    if not a or not (a.get("interview") or {}).get("video"):
+        raise HTTPException(status_code=404, detail="No video interview for this application")
+    is_emp = bool(employer_email) and employer_email.lower() == a["employer_email"]
+    is_me = bool(email) and email.lower() == a["email"]
+    if not (is_emp or is_me):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    ev = a["interview"]
+    name = (ev.get("contact_name") or a.get("company") or "Employer") if is_emp else a.get("name", "Applicant")
+    try:
+        url = await join_url(ev["video"], name, is_emp, ev["date"], ev["time"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"url": url, "provider": ev["video"].get("provider")}
