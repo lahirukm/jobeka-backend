@@ -24,6 +24,7 @@ Help & support
   Admin: GET /api/admin/support-tickets · PATCH /api/admin/support-tickets/{id} {status?, reply?}
 """
 import os
+from urllib.parse import quote
 from datetime import datetime, timedelta
 
 from bson import ObjectId
@@ -32,6 +33,7 @@ from fastapi import APIRouter, HTTPException, Depends, Header
 
 from database import database, jobs_collection
 from auth import get_current_user, hash_password, verify_password
+from video_service import start_ts, TZ_MIN
 
 router = APIRouter(tags=["My account"])
 
@@ -112,6 +114,62 @@ APP_TEXT = {
 def _money(n):
     return f"LKR {float(n or 0):,.2f}"
 
+def _utc(ts: float) -> datetime:
+    return datetime.utcfromtimestamp(ts)
+
+def _nice_time(t: str) -> str:
+    try:
+        return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        return t
+
+def _interview_reminders(a: dict, ev: dict, employer: bool, now: datetime) -> list:
+    """'Interview today', 'starts in 15 minutes' and '… is waiting in the video room' for one interview.
+       Each reminder appears only once its time has come (so LiveAlerts rings at the right moment)."""
+    try:
+        start = _utc(start_ts(ev["date"], ev["time"]))
+    except (KeyError, ValueError):
+        return []
+    if ev.get("outcome") or now > start + timedelta(hours=2):
+        return []
+    aid, online = str(a["_id"]), ev.get("mode") == "online"
+    who = a.get("name") or "the applicant"
+    job = a.get("job_title") or "the job"
+    where = "Online video" if online else (ev.get("address") or "At the company")
+    path = "/employer-interviews" if employer else "/my-applications"
+    pre = "emp-" if employer else ""
+    out = []
+    # 1) the morning of the interview day (6 AM Sri Lanka time) — skipped if it was only sent today
+    day_start = datetime.strptime(ev["date"], "%Y-%m-%d") - timedelta(minutes=TZ_MIN) + timedelta(hours=6)
+    sent = ev.get("sentAt") or day_start
+    sent_same_day = (sent + timedelta(minutes=TZ_MIN)).date() == (day_start + timedelta(minutes=TZ_MIN)).date()
+    if now >= day_start and not sent_same_day and now < start - timedelta(minutes=15):
+        out.append({"id": f"{pre}rem-{aid}-day-{ev['date']}-{ev['time']}", "kind": "applications",
+                    "title": f"Interview today with {who} ⏰" if employer else "Your interview is today ⏰",
+                    "body": f"{job} · {_nice_time(ev['time'])} · {where}" if employer
+                            else f"{job} at {a.get('company') or 'the company'} · {_nice_time(ev['time'])} · {where}. Tap to confirm.",
+                    "icon": "alarm", "color": "#7C3AED", "at": day_start, "link": {"path": path}})
+    # 2) 15 minutes before
+    soon = start - timedelta(minutes=15)
+    if now >= soon:
+        if employer:
+            body = f"{job} · {_nice_time(ev['time'])}. " + ("Open Interviews and tap Start video interview." if online else f"{who} is coming to your place.")
+        else:
+            body = f"{job} · {_nice_time(ev['time'])}. " + ("Tap here, then Join video interview." if online else "Leave now — tap for directions.")
+        out.append({"id": f"{pre}rem-{aid}-soon-{ev['date']}-{ev['time']}", "kind": "applications",
+                    "title": f"Interview with {who} in 15 min" if employer else "Your interview starts in 15 minutes",
+                    "body": body, "icon": "videocam" if online else "time", "color": "#DC2626", "at": soon, "link": {"path": path}})
+    # 3) the other side already opened the video room
+    if online:
+        other = ev.get("applicant_joinedAt") if employer else ev.get("employer_joinedAt")
+        mine = ev.get("employer_joinedAt") if employer else ev.get("applicant_joinedAt")
+        if other and now - other < timedelta(minutes=60) and not (mine and mine >= other):
+            out.append({"id": f"{pre}rem-{aid}-waiting-{int(other.timestamp())}", "kind": "applications",
+                        "title": f"{who} is waiting in the video room 🎥" if employer else "The employer is waiting for you 🎥",
+                        "body": f"{job} — tap and join now." if employer else f"{a.get('company') or 'The employer'} opened the interview room. Tap and join now.",
+                        "icon": "videocam", "color": "#16A34A", "at": other, "link": {"path": path}})
+    return out
+
 @router.get("/api/me/notifications")
 async def notifications(user_id: str = Depends(get_current_user)):
     u = await _me(user_id)
@@ -130,6 +188,29 @@ async def notifications(user_id: str = Depends(get_current_user)):
                           "body": body.format(company=a.get("company") or "The employer", title=a.get("job_title") or "the job"),
                           "icon": icon, "color": color, "at": a["updatedAt"],
                           "link": {"path": "/my-applications"}})
+            if a["status"] == "interview" and a.get("interview"):
+                items += _interview_reminders(a, a["interview"], False, datetime.utcnow())
+
+        # ── employer side: new applicants, replies to invitations, interview reminders
+        async for a in applications_collection.find({"employer_email": email, "status": {"$ne": "withdrawn"},
+                                                     "$or": [{"createdAt": {"$gte": since}}, {"updatedAt": {"$gte": since}}]}):
+            who, job = a.get("name") or "An applicant", a.get("job_title") or "your job"
+            if a["status"] == "applied" and a["createdAt"] >= since:
+                items.append({"id": f"emp-new-{a['_id']}", "kind": "applications", "title": f"New applicant for {job}",
+                              "body": f"{who} applied. Open to see the CV.", "icon": "person-add", "color": "#2563EB",
+                              "at": a["createdAt"], "link": {"path": f"/applicants?id={a['job_id']}&title={quote(job)}"}})
+            for k in ("interview", "joining"):
+                ev = a.get(k) or {}
+                if ev.get("respondedAt") and ev["respondedAt"] >= since and ev.get("response") in ("accepted", "reschedule"):
+                    ok = ev["response"] == "accepted"
+                    what = "the interview" if k == "interview" else "the first working day"
+                    items.append({"id": f"emp-resp-{a['_id']}-{k}-{int(ev['respondedAt'].timestamp())}", "kind": "applications",
+                                  "title": f"{who} confirmed {what} ✅" if ok else f"{who} asked for another time",
+                                  "body": f"{job} · {ev.get('date')} {_nice_time(ev.get('time', ''))}" if ok else f"“{ev.get('response_note', '')}” — tap to set a new time.",
+                                  "icon": "checkmark-circle" if ok else "swap-horizontal", "color": "#16A34A" if ok else "#D97706",
+                                  "at": ev["respondedAt"], "link": {"path": "/employer-interviews" if k == "interview" else f"/applicants?id={a['job_id']}&title={quote(job)}"}})
+            if a["status"] == "interview" and a.get("interview"):
+                items += _interview_reminders(a, a["interview"], True, datetime.utcnow())
 
     if prefs["payments"]:
         TX = {

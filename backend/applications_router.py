@@ -15,6 +15,9 @@ Employer: GET    /api/jobs/{job_id}/applications?employer_email=
           PATCH  /api/applications/{aid}                {employer_email, status}
           POST   /api/applications/{aid}/schedule       interview or first working day (date, time, place / online link)
 Seeker:   POST   /api/applications/{aid}/respond        {email, kind, response: accepted|reschedule, note}
+Employer: GET    /api/applications/employer/interviews?employer_email=   every interview (today / upcoming / past)
+          POST   /api/applications/{aid}/outcome        {employer_email, outcome: done|no_show}
+Both:     GET    /api/applications/{aid}/video          personal link to the video room (also records who joined)
 """
 import re
 from datetime import datetime
@@ -26,7 +29,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 
 from database import database, jobs_collection
-from video_service import create_room, join_url, _key as video_key
+from video_service import create_room, join_url, start_ts, _key as video_key
 
 router = APIRouter(prefix="/api", tags=["Full-time applications"])
 applications_collection = database.get_collection("applications")
@@ -301,4 +304,52 @@ async def video_join(aid: str, email: str = "", employer_email: str = ""):
         url = await join_url(ev["video"], name, is_emp, ev["date"], ev["time"])
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # the other side gets "… is waiting in the video room" (see /api/me/notifications)
+    await applications_collection.update_one({"_id": a["_id"]}, {"$set": {
+        f"interview.{'employer' if is_emp else 'applicant'}_joinedAt": datetime.utcnow()}})
     return {"url": url, "provider": ev["video"].get("provider")}
+
+
+# ─────────────────────────── employer: all interviews in one place
+@router.get("/applications/employer/interviews")
+async def employer_interviews(employer_email: str):
+    """Today / upcoming / past interviews of all this employer's jobs (newest decisions kept 14 days)."""
+    emp = employer_email.lower().strip()
+    if not emp:
+        raise HTTPException(status_code=400, detail="employer_email is required")
+    out = []
+    async for a in applications_collection.find({"employer_email": emp, "interview": {"$exists": True},
+                                                 "status": {"$in": ["interview", "hired", "rejected"]}}):
+        ev = a.get("interview") or {}
+        try:
+            start = start_ts(ev["date"], ev["time"])
+        except (KeyError, ValueError):
+            continue
+        if a["status"] != "interview" and start < datetime.utcnow().timestamp() - 14 * 86400:
+            continue                                         # decided long ago
+        d = _out(a)
+        d["has_cv"] = bool(a.get("cv"))
+        d["has_cv_file"] = bool(a.get("cv_file"))
+        d.pop("cv", None)
+        d["start_ts"] = start
+        out.append(d)
+    out.sort(key=lambda d: d["start_ts"])
+    return out
+
+
+@router.post("/applications/{aid}/outcome")
+async def interview_outcome(aid: str, body: dict):
+    """After the interview: done (then Hire / Not selected) or no_show (didn't come)."""
+    a = await applications_collection.find_one({"_id": _oid(aid)})
+    if not a:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if a["employer_email"] != (body.get("employer_email") or "").lower():
+        raise HTTPException(status_code=403, detail="Not your job")
+    if not a.get("interview"):
+        raise HTTPException(status_code=400, detail="No interview for this applicant")
+    outcome = body.get("outcome")
+    if outcome not in ("done", "no_show", ""):
+        raise HTTPException(status_code=400, detail="Invalid outcome")
+    await applications_collection.update_one({"_id": a["_id"]}, {"$set": {
+        "interview.outcome": outcome, "interview.outcomeAt": datetime.utcnow(), "updatedAt": datetime.utcnow()}})
+    return _out(await applications_collection.find_one({"_id": a["_id"]}))
