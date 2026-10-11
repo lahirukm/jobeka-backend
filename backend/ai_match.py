@@ -33,6 +33,11 @@ users_collection        = database.get_collection("users")
 cv_collection           = database.get_collection("cv_profiles")
 applications_collection = database.get_collection("applications")
 events_collection       = database.get_collection("ai_events")     # optional: part-time cancellations
+training_collection     = database.get_collection("ai_training")   # predictions + real outcomes → retraining data
+
+FT_COLS = ["skill_match", "experience_match", "salary_match", "education_match", "language_match",
+           "trust_score", "reliability_score", "completed_jobs_count", "cancelled_jobs_count", "no_show_count"]
+PT_COLS = ["distance_km", "availability_match", "skill_match_ratio", "trust_score", "reliability_score"]
 
 LABELS = {0: "Not Suitable", 1: "Moderate Match", 2: "Strong Match"}
 EDU = ["no formal", "o/l", "a/l", "certificate", "diploma", "bachelor", "master", "phd"]
@@ -397,3 +402,54 @@ async def match(job: dict, p: dict, lat=None, lng=None):
     out["features"] = f
     out["reasons"] = [{"tone": t, "text": x} for t, x in reasons]
     return out
+
+
+# ═════════════════════════════════════════════════════════════════════
+# FEEDBACK LOOP — what the AI said  +  what really happened  →  new training data
+# ═════════════════════════════════════════════════════════════════════
+async def log(job: dict, email: str, out: dict, final: bool = False):
+    """Remember the AI's prediction for (person, job). Features are frozen once the outcome is known,
+       so the training row shows what the model saw *before* the decision (no data leakage)."""
+    if not out or not email:
+        return
+    now = datetime.utcnow()
+    key = {"model": out["model"], "email": email.lower(), "job_id": str(job["_id"])}
+    data = {"features": out["features"], "predicted": out["prediction"], "score": out["score"],
+            "gated": bool(out.get("gated")), "job_title": job.get("title", ""), "updatedAt": now}
+    if final:   # decision already made → only create, never overwrite
+        await training_collection.update_one(key, {"$setOnInsert": {**data, "createdAt": now}}, upsert=True)
+    else:
+        await training_collection.update_one(key, {"$set": data, "$setOnInsert": {"createdAt": now}}, upsert=True)
+
+
+async def outcome(row: dict):
+    """→ (label, reason) from what really happened, or (None, reason) while we don't know yet.
+       2 = good match, 1 = in between, 0 = bad match  (same classes as the trained models)."""
+    from bson import ObjectId
+    job = await jobs_collection.find_one({"_id": ObjectId(row["job_id"])}) if ObjectId.is_valid(row["job_id"]) else None
+    if row["model"] == "full_time":
+        a = await applications_collection.find_one({"job_id": row["job_id"], "email": row["email"], "status": {"$ne": "withdrawn"}})
+        if not a:
+            return None, "did not apply"
+        if a["status"] == "hired":
+            return 2, "hired"
+        if (a.get("interview") or {}).get("outcome") == "no_show":
+            return 0, "no-show"
+        if a["status"] == "rejected":
+            return 0, "not selected"
+        if a["status"] in ("shortlisted", "interview") and job and job.get("status") == "closed":
+            return 1, "shortlisted, not hired"
+        return None, a["status"]
+    # part-time
+    if not job:
+        return None, "job deleted"
+    by = ((job.get("appliedBy") or {}).get("email") or "").lower()
+    if by != row["email"]:
+        return None, "taken by someone else" if by else "not taken"
+    if job.get("status") == "closed":
+        return 2, "completed"
+    return None, "in progress"
+
+
+def is_final_app(a: dict) -> bool:
+    return a.get("status") in ("hired", "rejected") or bool((a.get("interview") or {}).get("outcome"))

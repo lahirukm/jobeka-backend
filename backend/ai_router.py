@@ -1,4 +1,7 @@
-from fastapi import APIRouter, HTTPException
+import csv
+import io
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import Response
 from typing import Optional
 import pandas as pd
 from bson import ObjectId
@@ -128,6 +131,7 @@ async def applicants_match(job_id: str, employer_email: str):
         r = await ai_match.match(job, p)
         if r:
             out[str(a["_id"])] = r
+            await ai_match.log(job, a["email"], r, final=ai_match.is_final_app(a))
     return {"available": ml_loader.full_time_model is not None, "matches": out}
 
 
@@ -136,6 +140,13 @@ async def job_match(job_id: str, email: str, lat: Optional[float] = None, lng: O
     job = await _job(job_id)
     p = await ai_match.person(email)
     r = await ai_match.match(job, p, lat, lng)
+    if r:
+        if ai_match.is_part_time(job):
+            final = job.get("status") in ("applied", "closed")
+        else:
+            a = await database.get_collection("applications").find_one({"job_id": job_id, "email": p["email"]})
+            final = bool(a and ai_match.is_final_app(a))
+        await ai_match.log(job, p["email"], r, final=final)
     return r or {"available": False}
 
 
@@ -154,3 +165,54 @@ async def part_time_best(email: str, lat: Optional[float] = None, lng: Optional[
                         "distance_km": r["features"]["distance_km"], "reasons": r["reasons"]})
     out.sort(key=lambda x: -x["score"])
     return {"available": True, "jobs": out[:max(1, min(limit, 100))]}
+
+
+# ════════════════════════════════════════════
+# RETRAINING DATA (admin dashboard → "AI models")
+#   GET /api/ai/training/stats                    how many predictions have a real outcome, live accuracy
+#   GET /api/ai/training.csv?model=full_time       CSV for Colab (features + label) → retrain → new .pkl
+# ════════════════════════════════════════════
+from admin_router import check_admin
+
+async def _rows(model: str):
+    rows = []
+    async for r in ai_match.training_collection.find({"model": model}).sort("createdAt", 1):
+        label, why = await ai_match.outcome(r)
+        rows.append((r, label, why))
+    return rows
+
+@router.get("/training/stats", dependencies=[Depends(check_admin)])
+async def training_stats():
+    out = {"models": {"full_time": ml_loader.full_time_model is not None, "part_time": ml_loader.part_time_model is not None}}
+    for m in ("full_time", "part_time"):
+        rows = await _rows(m)
+        done = [(r, l) for r, l, _ in rows if l is not None]
+        right = sum(1 for r, l in done if r.get("predicted") == l)
+        out[m] = {
+            "predictions": len(rows), "with_outcome": len(done), "waiting": len(rows) - len(done),
+            "labels": {str(k): sum(1 for _, l in done if l == k) for k in (0, 1, 2)},
+            "accuracy": round(right / len(done), 3) if done else None,
+            "recent": [{"job": r.get("job_title", ""), "email": r["email"], "score": r.get("score"),
+                        "predicted": CLASS_LABELS.get(r.get("predicted"), "?"), "outcome": why,
+                        "label": None if l is None else CLASS_LABELS.get(l), "correct": None if l is None else r.get("predicted") == l}
+                       for r, l, why in rows[-12:][::-1]],
+        }
+    return out
+
+
+@router.get("/training.csv", dependencies=[Depends(check_admin)])
+async def training_csv(model: str = "full_time", include_pending: bool = False):
+    if model not in ("full_time", "part_time"):
+        raise HTTPException(status_code=400, detail="model must be full_time or part_time")
+    cols = ai_match.FT_COLS if model == "full_time" else ai_match.PT_COLS
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols + ["label", "outcome", "ai_predicted", "ai_score", "gated", "job_title", "created"])
+    for r, label, why in await _rows(model):
+        if label is None and not include_pending:
+            continue
+        f = r.get("features") or {}
+        w.writerow([f.get(c, "") for c in cols] + ["" if label is None else label, why, r.get("predicted"), r.get("score"),
+                                                     int(bool(r.get("gated"))), r.get("job_title", ""), r.get("createdAt", "")])
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="jobeka_{model}_training.csv"'})
