@@ -1,13 +1,13 @@
 """
 JobEka — feedback on finished work, written with AI help.
 
-The user types a few words (e.g. "fast clean friendly cheap") + stars, taps "AI write",
+The user types a few words (e.g. "fast clean friendly cheap"), taps "AI write",
 and Gemini turns them into 2–3 polite sentences. The user can edit it, then save.
 
-  POST /api/feedback/ai        {kind, item_id, keywords, rating}   → {text, ai}
-  POST /api/feedback           {kind, item_id, rating, keywords, text, ai_used}   save / update mine
+  POST /api/feedback/ai        {kind, item_id, keywords}   → {text, ai}
+  POST /api/feedback           {kind, item_id, keywords, text, ai_used}   save / update mine
   GET  /api/feedback/mine      my feedback  → {"<kind>:<item_id>": {...}}
-  GET  /api/feedback/about?email=   feedback other people wrote about this person (+ average stars)
+  GET  /api/feedback/about?email=   feedback other people wrote about this person
 
 kind = "help" (Request now) · "booking" (service booking) · "part" (part-time job) · "full" (full-time application)
 All need the login token. The backend checks the item really belongs to the user and finds who it is about.
@@ -80,11 +80,10 @@ async def _item(kind: str, item_id: str, email: str) -> dict:
 def _words(keywords: str) -> list:
     return [w for w in re.split(r"[\s,]+", (keywords or "").strip()) if w][:12]
 
-def _fallback(words: list, rating: int, title: str, name: str) -> str:
+def _fallback(words: list, title: str, name: str) -> str:
     """Used when no AI key is set or the AI fails — still gives a sensible sentence."""
-    mood = "Great" if rating >= 4 else "Okay" if rating == 3 else "Not a good"
     who = f" with {name}" if name else ""
-    return f"{mood} experience{who} for {title}. In short: {', '.join(words)}."
+    return f"My experience{who} for {title}: {', '.join(words)}."
 
 
 # ─────────────────────────── AI writes the feedback from a few words
@@ -94,18 +93,16 @@ async def ai_write(body: dict, user_id: str = Depends(get_current_user)):
     words = _words(body.get("keywords"))
     if not 1 <= len(words) <= 8:
         raise HTTPException(status_code=400, detail="Type 1 to 8 words, e.g. fast clean friendly")
-    rating = max(1, min(5, int(body.get("rating") or 5)))
     it = await _item(body.get("kind"), body.get("item_id"), me["email"])
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
-        return {"text": _fallback(words, rating, it["title"], it["about_name"]), "ai": "builtin"}
+        return {"text": _fallback(words, it["title"], it["about_name"]), "ai": "builtin"}
     prompt = (
         "You help a user of JobEka, a Sri Lankan jobs and services app, write a short review.\n"
         f"They are reviewing a {WHAT[body.get('kind')]}: \"{it['title']}\""
         + (f" with {it['about_name']}" if it["about_name"] else "") + ".\n"
-        f"Star rating: {rating} out of 5.\n"
         f"Their words: {', '.join(words)}\n"
-        "Write 2 or 3 short sentences in simple, polite English, in first person, that match the rating and use the "
-        "meaning of their words. Do not invent facts, prices, names or dates they did not give. No emojis, no hashtags.\n"
+        "Write 2 or 3 short sentences in simple, polite English, in first person, that use the meaning of their words. "
+        "Work out from their words whether it was good, mixed or bad, and keep that tone. Do not invent facts, prices, names or dates they did not give. No emojis, no hashtags.\n"
         'Reply as JSON only: {"feedback": "..."}'
     )
     try:
@@ -118,7 +115,7 @@ async def ai_write(body: dict, user_id: str = Depends(get_current_user)):
         return {"text": out, "ai": provider}
     except Exception as e:
         print("Feedback AI error:", e)
-        return {"text": _fallback(words, rating, it["title"], it["about_name"]), "ai": "builtin"}
+        return {"text": _fallback(words, it["title"], it["about_name"]), "ai": "builtin"}
 
 
 # ─────────────────────────── save (one feedback per item — saving again updates it)
@@ -130,16 +127,15 @@ async def save(body: dict, user_id: str = Depends(get_current_user)):
     text = re.sub(r"\s+", " ", str(body.get("text") or "")).strip()[:600]
     if len(text) < 5:
         raise HTTPException(status_code=400, detail="Write a few words of feedback")
-    rating = max(1, min(5, int(body.get("rating") or 5)))
     now = datetime.utcnow()
     doc = {"kind": kind, "item_id": item_id, "title": it["title"],
            "from_email": me["email"], "from_name": me.get("name", ""),
            "about_email": it["about_email"], "about_name": it["about_name"],
-           "rating": rating, "keywords": " ".join(_words(body.get("keywords"))), "text": text,
+           "keywords": " ".join(_words(body.get("keywords"))), "text": text,
            "ai_used": bool(body.get("ai_used")), "updatedAt": now}
     await feedback_collection.update_one({"from_email": me["email"], "kind": kind, "item_id": item_id},
                                          {"$set": doc, "$setOnInsert": {"createdAt": now}}, upsert=True)
-    return {"ok": True, "rating": rating, "text": text}
+    return {"ok": True, "text": text}
 
 
 @router.get("/mine")
@@ -147,16 +143,15 @@ async def mine(user_id: str = Depends(get_current_user)):
     me = await _me(user_id)
     out = {}
     async for f in feedback_collection.find({"from_email": me["email"]}):
-        out[f"{f['kind']}:{f['item_id']}"] = {"rating": f["rating"], "text": f["text"], "keywords": f.get("keywords", "")}
+        out[f"{f['kind']}:{f['item_id']}"] = {"text": f["text"], "keywords": f.get("keywords", "")}
     return out
 
 
 @router.get("/about")
 async def about(email: str):
-    """Public: what people said about a provider / employer — average stars + latest reviews."""
-    items, total = [], 0
+    """Public: what people said about a provider / employer — latest reviews."""
+    items = []
     async for f in feedback_collection.find({"about_email": email.lower().strip()}).sort("updatedAt", -1).limit(50):
-        total += f["rating"]
-        items.append({"rating": f["rating"], "text": f["text"], "from": (f.get("from_name") or "User").split(" ")[0],
+        items.append({"text": f["text"], "from": (f.get("from_name") or "User").split(" ")[0],
                       "title": f.get("title", ""), "at": f["updatedAt"].isoformat()})
-    return {"count": len(items), "average": round(total / len(items), 1) if items else None, "items": items}
+    return {"count": len(items), "items": items}
