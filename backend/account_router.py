@@ -34,6 +34,7 @@ from fastapi import APIRouter, HTTPException, Depends, Header
 from database import database, jobs_collection
 from auth import get_current_user, hash_password, verify_password
 from video_service import start_ts, TZ_MIN
+from feedback_router import feedback_notifications
 
 router = APIRouter(tags=["My account"])
 
@@ -243,6 +244,8 @@ async def notifications(user_id: str = Depends(get_current_user)):
             items.append({"id": f"jobs-{newest['_id']}", "kind": "new_jobs", "title": f"{n} new job{'s' if n > 1 else ''} posted",
                           "body": f"Latest: {newest.get('title', 'a new job')}{' · ' + newest['location'] if newest.get('location') else ''}",
                           "icon": "briefcase", "color": "#F97316", "at": newest["createdAt"], "link": {"path": "/(tabs)/jobs"}})
+
+    items += await feedback_notifications(email, since)      # someone wrote feedback about me
 
     async for tk in tickets_collection.find({"user_id": user_id, "reply": {"$nin": [None, ""]}, "repliedAt": {"$gte": since}}):
         items.append({"id": f"tk-{tk['_id']}-{int(tk['repliedAt'].timestamp())}", "kind": "support", "title": "JobEka Support replied",

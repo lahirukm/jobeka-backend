@@ -8,6 +8,8 @@ and Gemini turns them into 2–3 polite sentences. The user can edit it, then sa
   POST /api/feedback           {kind, item_id, keywords, text, ai_used}   save / update mine
   GET  /api/feedback/mine      my feedback  → {"<kind>:<item_id>": {...}}
   GET  /api/feedback/about?email=   feedback other people wrote about this person
+  GET  /api/feedback/about-me        feedback people wrote about ME (provider / employer) → {count, new, items}
+                                     ?mark_seen=true marks them as read (the "Reviews about me" screen does this)
 
 kind = "help" (Request now) · "booking" (service booking) · "part" (part-time job) · "full" (full-time application)
 All need the login token. The backend checks the item really belongs to the user and finds who it is about.
@@ -30,6 +32,7 @@ users_collection    = database.get_collection("users")
 KINDS = ("help", "booking", "part", "full")
 WHAT = {"help": "on-demand service", "booking": "booked service", "part": "part-time job", "full": "job application and hiring process"}
 DONE_APP = ("hired", "rejected", "interview")
+KIND_LABEL = {"help": "Service", "booking": "Booking", "part": "Part-time job", "full": "Full-time job"}
 
 
 def _oid(v):
@@ -76,6 +79,13 @@ async def _item(kind: str, item_id: str, email: str) -> dict:
     if a.get("status") not in DONE_APP:
         raise HTTPException(status_code=400, detail="You can give feedback after the interview or the employer's decision")
     return {"title": a.get("job_title", "job"), "about_email": a.get("employer_email", ""), "about_name": a.get("company", "")}
+
+def _about(email: str) -> dict:
+    """Mongo filter for feedback about this email (case-insensitive — older rows may have capitals)."""
+    return {"about_email": {"$regex": f"^{re.escape((email or '').strip())}$", "$options": "i"}}
+
+def _first(name: str) -> str:
+    return (name or "User").split(" ")[0]
 
 def _words(keywords: str) -> list:
     return [w for w in re.split(r"[\s,]+", (keywords or "").strip()) if w][:12]
@@ -130,7 +140,7 @@ async def save(body: dict, user_id: str = Depends(get_current_user)):
     now = datetime.utcnow()
     doc = {"kind": kind, "item_id": item_id, "title": it["title"],
            "from_email": me["email"], "from_name": me.get("name", ""),
-           "about_email": it["about_email"], "about_name": it["about_name"],
+           "about_email": (it["about_email"] or "").lower().strip(), "about_name": it["about_name"],
            "keywords": " ".join(_words(body.get("keywords"))), "text": text,
            "ai_used": bool(body.get("ai_used")), "updatedAt": now}
     await feedback_collection.update_one({"from_email": me["email"], "kind": kind, "item_id": item_id},
@@ -151,7 +161,35 @@ async def mine(user_id: str = Depends(get_current_user)):
 async def about(email: str):
     """Public: what people said about a provider / employer — latest reviews."""
     items = []
-    async for f in feedback_collection.find({"about_email": email.lower().strip()}).sort("updatedAt", -1).limit(50):
+    async for f in feedback_collection.find(_about(email)).sort("updatedAt", -1).limit(50):
         items.append({"text": f["text"], "from": (f.get("from_name") or "User").split(" ")[0],
                       "title": f.get("title", ""), "at": f["updatedAt"].isoformat()})
     return {"count": len(items), "items": items}
+
+
+@router.get("/about-me")
+async def about_me(mark_seen: bool = False, user_id: str = Depends(get_current_user)):
+    """Feedback customers / workers / applicants wrote about me — shown on my dashboards and the Reviews screen."""
+    me = await _me(user_id)
+    seen = me.get("feedback_seen_at") or datetime(2000, 1, 1)
+    items = []
+    async for f in feedback_collection.find(_about(me["email"])).sort("updatedAt", -1).limit(100):
+        items.append({"id": str(f["_id"]), "kind": f["kind"], "kind_label": KIND_LABEL.get(f["kind"], ""),
+                      "title": f.get("title", ""), "text": f["text"], "keywords": f.get("keywords", ""),
+                      "from": _first(f.get("from_name")), "ai_used": bool(f.get("ai_used")),
+                      "new": f["updatedAt"] > seen, "at": f["updatedAt"].isoformat()})
+    if mark_seen:
+        await users_collection.update_one({"_id": me["_id"]}, {"$set": {"feedback_seen_at": datetime.utcnow()}})
+    return {"count": len(items), "new": sum(1 for i in items if i["new"]), "items": items}
+
+
+async def feedback_notifications(email: str, since: datetime) -> list:
+    """Used by /api/me/notifications — "New feedback from Nimal 💬" when someone reviews me."""
+    out = []
+    async for f in feedback_collection.find({**_about(email), "updatedAt": {"$gte": since}}):
+        out.append({"id": f"fb-{f['_id']}-{int(f['updatedAt'].timestamp())}", "kind": "applications",
+                    "title": f"New feedback from {_first(f.get('from_name'))} 💬",
+                    "body": f"{f.get('title', '')}: “{f['text'][:110]}{'…' if len(f['text']) > 110 else ''}”",
+                    "icon": "chatbubble-ellipses", "color": "#7C3AED", "at": f["updatedAt"],
+                    "link": {"path": "/my-reviews"}})
+    return out
