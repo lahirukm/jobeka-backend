@@ -4,7 +4,7 @@ JobEka — "✨ Write with AI" on the Post new job form.
 The employer types the Job title + Category (+ anything else already filled in),
 taps the button, and Gemini writes the Job description and the Requirements.
 
-  POST /api/jobs/ai-write   (login token)
+  POST /api/job-ai/write   (login token)
        {title, category, type, salary?, working_hours?, location?,
         required_skills?, experience_years?, education_level?, languages?}
     → {description, requirements, ai: "gemini" | "claude" | "builtin"}
@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from auth import get_current_user
 from cv_router import _ask_ai, GEMINI_API_KEY, ANTHROPIC_API_KEY     # same Gemini helper as the CV builder
 
-router = APIRouter(prefix="/api/jobs", tags=["Jobs — AI writer"])
+router = APIRouter(prefix="/api/job-ai", tags=["Jobs — AI writer"])
 
 
 def _s(v, n=120) -> str:
@@ -46,7 +46,7 @@ def _fallback(d: dict) -> dict:
     return {"description": desc, "requirements": "\n".join("• " + r for r in req)}
 
 
-@router.post("/ai-write")
+@router.post("/write")
 async def ai_write(body: dict, user_id: str = Depends(get_current_user)):
     d = {"title": _s(body.get("title"), 80), "category": _s(body.get("category"), 60),
          "type": _s(body.get("type"), 30) or "Full Time", "salary": _s(body.get("salary"), 60),
