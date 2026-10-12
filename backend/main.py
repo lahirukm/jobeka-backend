@@ -19,6 +19,7 @@ from account_router import router as account_router
 from govt_jobs_router import router as govt_jobs_router
 from places_router import router as places_router
 from feedback_router import router as feedback_router
+from job_ai_router import router as job_ai_router
 
 
 @asynccontextmanager
@@ -58,6 +59,7 @@ app.include_router(account_router)       # saved jobs, notifications, privacy & 
 app.include_router(govt_jobs_router)     # government jobs (admin posts poster + Gazette PDF)
 app.include_router(places_router)        # address suggestions while typing
 app.include_router(feedback_router)       # AI feedback on finished jobs / services (Gemini)
+app.include_router(job_ai_router)         # ✨ AI writes job description + requirements (Gemini)
 app.include_router(service_router)   # on-demand "Request now" (customer ↔ service provider)
 
 
