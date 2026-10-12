@@ -20,6 +20,7 @@ from govt_jobs_router import router as govt_jobs_router
 from places_router import router as places_router
 from feedback_router import router as feedback_router
 from job_ai_router import router as job_ai_router
+from interview_prep_router import router as interview_prep_router
 
 
 @asynccontextmanager
@@ -60,6 +61,7 @@ app.include_router(govt_jobs_router)     # government jobs (admin posts poster +
 app.include_router(places_router)        # address suggestions while typing
 app.include_router(feedback_router)       # AI feedback on finished jobs / services (Gemini)
 app.include_router(job_ai_router)         # ✨ AI writes job description + requirements (Gemini)
+app.include_router(interview_prep_router) # Interview prep: the 5 general answers from the user's own CV
 app.include_router(service_router)   # on-demand "Request now" (customer ↔ service provider)
 
 
