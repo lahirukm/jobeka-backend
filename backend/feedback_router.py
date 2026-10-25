@@ -1,14 +1,14 @@
 """
 JobEka — feedback on finished work, written with AI help.
 
-The user types a few words (e.g. "fast clean friendly cheap"), taps "AI write",
-and Gemini turns them into 2–3 polite sentences. The user can edit it, then save.
+The user picks 1–5 stars, types a few words (e.g. "fast clean friendly"), taps "Write with AI",
+and Gemini turns them into 2–3 polite sentences that match the stars. The user can edit it, then save.
 
-  POST /api/feedback/ai        {kind, item_id, keywords}   → {text, ai}
-  POST /api/feedback           {kind, item_id, keywords, text, ai_used}   save / update mine
+  POST /api/feedback/ai        {kind, item_id, keywords, rating?}   → {text, ai}
+  POST /api/feedback           {kind, item_id, rating, keywords, text, ai_used}   save / update mine
   GET  /api/feedback/mine      my feedback  → {"<kind>:<item_id>": {...}}
-  GET  /api/feedback/about?email=   feedback other people wrote about this person
-  GET  /api/feedback/about-me        feedback people wrote about ME (provider / employer) → {count, new, items}
+  GET  /api/feedback/about?email=   reviews about this person → {count, average, breakdown, items}
+  GET  /api/feedback/about-me        reviews about ME (provider / employer) → {count, new, average, breakdown, items}
                                      ?mark_seen=true marks them as read (the "Reviews about me" screen does this)
 
 kind = "help" (Request now) · "booking" (service booking) · "part" (part-time job) · "full" (full-time application)
@@ -32,7 +32,8 @@ users_collection    = database.get_collection("users")
 KINDS = ("help", "booking", "part", "full")
 WHAT = {"help": "on-demand service", "booking": "booked service", "part": "part-time job", "full": "job application and hiring process"}
 DONE_APP = ("hired", "rejected", "interview")
-KIND_LABEL = {"help": "Service", "booking": "Booking", "part": "Part-time job", "full": "Full-time job"}
+KIND_LABEL = {"help": "On-demand service", "booking": "Booking", "part": "Part-time job", "full": "Full-time job"}
+STAR_WORD = {1: "very bad", 2: "bad", 3: "okay / mixed", 4: "good", 5: "excellent"}
 
 
 def _oid(v):
@@ -87,6 +88,33 @@ def _about(email: str) -> dict:
 def _first(name: str) -> str:
     return (name or "User").split(" ")[0]
 
+def _short(name: str) -> str:
+    """'Nimal Perera' → 'Nimal P.' — how real review apps show the writer."""
+    parts = (name or "JobEka user").split()
+    return parts[0] + (f" {parts[-1][0].upper()}." if len(parts) > 1 else "")
+
+def _rating(v):
+    try:
+        r = int(v)
+    except (TypeError, ValueError):
+        return None
+    return r if 1 <= r <= 5 else None
+
+def _summary(rows: list) -> dict:
+    """Average stars + how many 5★, 4★ … 1★ (old reviews without stars are skipped)."""
+    stars = [r["rating"] for r in rows if r.get("rating")]
+    breakdown = {str(n): stars.count(n) for n in (5, 4, 3, 2, 1)}
+    return {"average": round(sum(stars) / len(stars), 1) if stars else None, "rated": len(stars), "breakdown": breakdown}
+
+def _row(f: dict, seen=None) -> dict:
+    out = {"id": str(f["_id"]), "kind": f["kind"], "kind_label": KIND_LABEL.get(f["kind"], ""),
+           "title": f.get("title", ""), "text": f["text"], "rating": f.get("rating"),
+           "from": _short(f.get("from_name")), "edited": bool(f.get("createdAt") and f["updatedAt"] > f["createdAt"]),
+           "at": f["updatedAt"].isoformat()}
+    if seen is not None:
+        out["new"] = f["updatedAt"] > seen
+    return out
+
 def _words(keywords: str) -> list:
     return [w for w in re.split(r"[\s,]+", (keywords or "").strip()) if w][:12]
 
@@ -101,8 +129,9 @@ def _fallback(words: list, title: str, name: str) -> str:
 async def ai_write(body: dict, user_id: str = Depends(get_current_user)):
     me = await _me(user_id)
     words = _words(body.get("keywords"))
-    if not 1 <= len(words) <= 8:
-        raise HTTPException(status_code=400, detail="Type 1 to 8 words, e.g. fast clean friendly")
+    if not words:
+        raise HTTPException(status_code=400, detail="Pick a tag or type a few words, e.g. fast clean friendly")
+    rating = _rating(body.get("rating"))
     it = await _item(body.get("kind"), body.get("item_id"), me["email"])
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         return {"text": _fallback(words, it["title"], it["about_name"]), "ai": "builtin"}
@@ -110,9 +139,11 @@ async def ai_write(body: dict, user_id: str = Depends(get_current_user)):
         "You help a user of JobEka, a Sri Lankan jobs and services app, write a short review.\n"
         f"They are reviewing a {WHAT[body.get('kind')]}: \"{it['title']}\""
         + (f" with {it['about_name']}" if it["about_name"] else "") + ".\n"
-        f"Their words: {', '.join(words)}\n"
+        + (f"Their star rating: {rating} out of 5 ({STAR_WORD[rating]}).\n" if rating else "")
+        + f"Their words: {', '.join(words)}\n"
         "Write 2 or 3 short sentences in simple, polite English, in first person, that use the meaning of their words. "
-        "Work out from their words whether it was good, mixed or bad, and keep that tone. Do not invent facts, prices, names or dates they did not give. No emojis, no hashtags.\n"
+        + ("Match the tone to the star rating. " if rating else "Work out from their words whether it was good, mixed or bad, and keep that tone. ")
+        + "Do not invent facts, prices, names or dates they did not give. No emojis, no hashtags.\n"
         'Reply as JSON only: {"feedback": "..."}'
     )
     try:
@@ -137,15 +168,18 @@ async def save(body: dict, user_id: str = Depends(get_current_user)):
     text = re.sub(r"\s+", " ", str(body.get("text") or "")).strip()[:600]
     if len(text) < 5:
         raise HTTPException(status_code=400, detail="Write a few words of feedback")
+    rating = _rating(body.get("rating"))
+    if not rating:
+        raise HTTPException(status_code=400, detail="Tap the stars to rate (1 to 5)")
     now = datetime.utcnow()
     doc = {"kind": kind, "item_id": item_id, "title": it["title"],
            "from_email": me["email"], "from_name": me.get("name", ""),
            "about_email": (it["about_email"] or "").lower().strip(), "about_name": it["about_name"],
-           "keywords": " ".join(_words(body.get("keywords"))), "text": text,
+           "rating": rating, "keywords": " ".join(_words(body.get("keywords"))), "text": text,
            "ai_used": bool(body.get("ai_used")), "updatedAt": now}
     await feedback_collection.update_one({"from_email": me["email"], "kind": kind, "item_id": item_id},
                                          {"$set": doc, "$setOnInsert": {"createdAt": now}}, upsert=True)
-    return {"ok": True, "text": text}
+    return {"ok": True, "rating": rating, "text": text}
 
 
 @router.get("/mine")
@@ -153,18 +187,15 @@ async def mine(user_id: str = Depends(get_current_user)):
     me = await _me(user_id)
     out = {}
     async for f in feedback_collection.find({"from_email": me["email"]}):
-        out[f"{f['kind']}:{f['item_id']}"] = {"text": f["text"], "keywords": f.get("keywords", "")}
+        out[f"{f['kind']}:{f['item_id']}"] = {"rating": f.get("rating"), "text": f["text"], "keywords": f.get("keywords", "")}
     return out
 
 
 @router.get("/about")
 async def about(email: str):
-    """Public: what people said about a provider / employer — latest reviews."""
-    items = []
-    async for f in feedback_collection.find(_about(email)).sort("updatedAt", -1).limit(50):
-        items.append({"text": f["text"], "from": (f.get("from_name") or "User").split(" ")[0],
-                      "title": f.get("title", ""), "at": f["updatedAt"].isoformat()})
-    return {"count": len(items), "items": items}
+    """Public: what people said about a provider / employer — average stars + latest reviews."""
+    items = [_row(f) async for f in feedback_collection.find(_about(email)).sort("updatedAt", -1).limit(100)]
+    return {"count": len(items), **_summary(items), "items": items}
 
 
 @router.get("/about-me")
@@ -172,15 +203,10 @@ async def about_me(mark_seen: bool = False, user_id: str = Depends(get_current_u
     """Feedback customers / workers / applicants wrote about me — shown on my dashboards and the Reviews screen."""
     me = await _me(user_id)
     seen = me.get("feedback_seen_at") or datetime(2000, 1, 1)
-    items = []
-    async for f in feedback_collection.find(_about(me["email"])).sort("updatedAt", -1).limit(100):
-        items.append({"id": str(f["_id"]), "kind": f["kind"], "kind_label": KIND_LABEL.get(f["kind"], ""),
-                      "title": f.get("title", ""), "text": f["text"], "keywords": f.get("keywords", ""),
-                      "from": _first(f.get("from_name")), "ai_used": bool(f.get("ai_used")),
-                      "new": f["updatedAt"] > seen, "at": f["updatedAt"].isoformat()})
+    items = [_row(f, seen) async for f in feedback_collection.find(_about(me["email"])).sort("updatedAt", -1).limit(200)]
     if mark_seen:
         await users_collection.update_one({"_id": me["_id"]}, {"$set": {"feedback_seen_at": datetime.utcnow()}})
-    return {"count": len(items), "new": sum(1 for i in items if i["new"]), "items": items}
+    return {"count": len(items), "new": sum(1 for i in items if i["new"]), **_summary(items), "items": items}
 
 
 async def feedback_notifications(email: str, since: datetime) -> list:
@@ -188,7 +214,8 @@ async def feedback_notifications(email: str, since: datetime) -> list:
     out = []
     async for f in feedback_collection.find({**_about(email), "updatedAt": {"$gte": since}}):
         out.append({"id": f"fb-{f['_id']}-{int(f['updatedAt'].timestamp())}", "kind": "applications",
-                    "title": f"New feedback from {_first(f.get('from_name'))} 💬",
+                    "title": (f"{'★' * f['rating']}{'☆' * (5 - f['rating'])}  New review from {_short(f.get('from_name'))}"
+                              if f.get("rating") else f"New review from {_short(f.get('from_name'))} 💬"),
                     "body": f"{f.get('title', '')}: “{f['text'][:110]}{'…' if len(f['text']) > 110 else ''}”",
                     "icon": "chatbubble-ellipses", "color": "#7C3AED", "at": f["updatedAt"],
                     "link": {"path": "/my-reviews"}})

@@ -14,6 +14,11 @@ Notifications (built from what really happened to the user)
   GET    /api/me/notification-settings
   PUT    /api/me/notification-settings      {applications, payments, new_jobs, offers}
 
+Activity history (Activity tab → "Clear history")
+  GET    /api/me/activity/hidden            {help: [ids], bookings: [ids], jobs: [ids]}
+  POST   /api/me/activity/clear             {tab, ids}  hide finished items from MY history only
+                                            (the employer / provider still keeps their records)
+
 Privacy & security
   POST   /api/me/change-password            {current_password, new_password}
   DELETE /api/me/account                    {password}
@@ -278,6 +283,30 @@ async def put_settings(body: dict, user_id: str = Depends(get_current_user)):
             prefs[k] = bool(body[k])
     await users_collection.update_one({"_id": u["_id"]}, {"$set": {"notif_prefs": prefs}})
     return prefs
+
+
+# ─────────────────────────── activity history ("Clear history")
+ACTIVITY_TABS = ("help", "bookings", "jobs")
+
+@router.get("/api/me/activity/hidden")
+async def activity_hidden(user_id: str = Depends(get_current_user)):
+    u = await _me(user_id)
+    h = u.get("activity_hidden") or {}
+    return {k: h.get(k, []) for k in ACTIVITY_TABS}
+
+@router.post("/api/me/activity/clear")
+async def activity_clear(body: dict, user_id: str = Depends(get_current_user)):
+    """Only hides the items from this user's Activity list — nothing is deleted, so payments,
+       the other side's history and the AI training data stay correct."""
+    tab = body.get("tab")
+    if tab not in ACTIVITY_TABS:
+        raise HTTPException(status_code=400, detail="Unknown history tab")
+    ids = [str(i) for i in (body.get("ids") or []) if ObjectId.is_valid(str(i))][:500]
+    if not ids:
+        return {"ok": True, "cleared": 0}
+    await users_collection.update_one({"_id": _oid(user_id)},
+                                      {"$addToSet": {f"activity_hidden.{tab}": {"$each": ids}}})
+    return {"ok": True, "cleared": len(ids)}
 
 
 # ─────────────────────────── privacy & security
